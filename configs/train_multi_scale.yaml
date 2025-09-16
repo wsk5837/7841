@@ -1,0 +1,84 @@
+# 多尺度训练配置 - 针对高分辨率图像优化
+seed: 7
+cpu_threads: 8
+
+# 数据路径
+data_root: data
+img_dir: raw
+mask_dir: masks_tumor
+
+# 多尺度训练设置
+multi_scale: true
+train_sizes: [512, 768, 1024, 1536]  # 分层训练尺寸
+patch_sizes: [256, 384, 512, 768]    # Patch切割尺寸
+max_patches_per_image: 8             # 每张图像最多生成8个patch
+
+# 智能切割设置
+lesion_crop_ratio: 0.7               # 70%概率切割病灶区域
+min_lesion_area: 100                 # 最小病灶面积（像素）
+
+# 旋转增强
+rotation_angles: [0, 90, 180, 270]   # 90度倍数旋转
+random_rotation_range: [-15, 15]     # 随机小角度旋转范围
+
+# 其他增强
+flip_p: 0.5
+color_jitter: 0.2
+gamma_jitter: 0.25
+
+# 数据划分
+val_split: 0.2
+overfit_k: 0
+overfit_val_on_train: false
+
+# 缓存设置
+cache_images: true
+
+# Loader设置
+batch: 4                             # 增加批次大小（多patch训练）
+num_workers: 2
+
+# 不平衡设置
+pos_weight_cap: 20.0
+
+# 损失函数（针对多尺度优化）
+loss_type: bce_focal_tversky
+bce_w: 0.6
+tversky_alpha: 0.3
+tversky_beta: 0.7
+focal_gamma: 1.33
+ft_lambda: 0.6
+
+# 优化器设置
+lr: 0.0008                          # 稍微降低学习率
+weight_decay: 0.0001
+plateau_patience: 15                # 增加耐心
+min_lr: 0.00001
+grad_clip: 1.0                      # 添加梯度裁剪
+cpu_amp: false
+
+# 训练设置
+epochs: 300                         # 增加训练轮次
+patience: 40                        # 增加早停耐心
+th_min: 0.05
+th_max: 0.95
+th_step: 0.05
+
+# EMA设置（多尺度训练建议开启）
+ema_decay: 0.999
+ema_eval: true
+ema_warmup_epochs: 10
+
+# 严格加载策略
+allow_partial: false
+strict_arch: true
+
+# 权重加载
+resume: ""
+resume_full: false
+auto_resume: false
+init_ckpt: ""
+init_prior_prob: 0.0285
+
+# 保存目录
+save_dir: runs_multi_scale

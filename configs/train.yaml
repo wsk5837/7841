@@ -1,0 +1,115 @@
+# =========================
+# 基础与数据
+# =========================
+seed: 7
+cpu_threads: 8
+
+data_root: data
+img_dir: raw
+mask_dir: masks_tumor
+
+# 划分
+val_split: 0.2
+overfit_k: 0
+overfit_val_on_train: false
+
+# =========================
+# 输入与增强
+# =========================
+img_size: 384
+flip_p: 0.5
+rotate90_p: 0.5
+jitter: 0.2
+gamma_jitter: 0.2
+
+# 采样（关键）
+crop_mode: mix          # mix / lesion / random / none
+crop_size: 320
+lesion_p: 0.9
+cache_images: true
+
+# =========================
+# DataLoader
+# =========================
+batch: 4
+num_workers: 0          # MPS/CPU 建议小一些
+
+# =========================
+# 不平衡设置
+# =========================
+pos_weight_cap: 10.0    # 上限，避免BCE过分压制正类
+
+# =========================
+# 模型结构
+# =========================
+base: 16
+depth: 4
+norm: gn                # gn / bn
+dropout: 0.05
+
+# =========================
+# 损失函数
+# =========================
+loss_type: focal_tversky        # bce_dice | bce_tversky | focal_tversky | combo
+tversky_alpha: 0.3
+tversky_beta: 0.8               # 小目标/漏检多→加大beta
+focal_gamma: 0.75
+bce_w: 0.25                     # 仅在 bce_* / combo 下生效
+dice_w: 0.75
+
+# =========================
+# 优化
+# =========================
+lr: 0.001
+weight_decay: 0.0001
+plateau_patience: 20
+min_lr: 0.00001
+grad_clip: 1.0
+cpu_amp: false
+
+# =========================
+# 训练轮次 & 早停 & 阈值网格
+# =========================
+epochs: 300
+patience: 50
+th_min: 0.05
+th_max: 0.95
+th_step: 0.05
+
+# =========================
+# EMA Teacher & 验证 TTA
+# =========================
+ema_decay: 0.999
+ema_eval: true
+ema_warmup_epochs: 5
+tta_val: true
+
+# =========================
+# 半监督（未标注）
+# =========================
+unlabeled_dir: unlabeled        # 相对 data_root；或改成绝对路径
+unlabeled_batch: 2
+unlabeled_weight: 0.3           # lambda_u（训练中会warm-up）
+pseudo_thr_high: 0.9            # 前景高置信
+pseudo_thr_low: 0.1             # 背景低置信
+use_consistency: false          # 预留开关（当前未使用）
+
+# =========================
+# 严格加载策略
+# =========================
+allow_partial: false
+strict_arch: true
+
+# =========================
+# 权重加载（从头开始）
+# =========================
+resume: ""                      # 不续训
+resume_full: false
+auto_resume: false              # 关闭自动断点续训
+init_ckpt: ""                   # 不加载旧权重
+init_prior_prob: 0.0285         # 输出层偏置先验
+
+# =========================
+# 保存目录
+# =========================
+save_dir: runs_mps

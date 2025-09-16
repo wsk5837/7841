@@ -1,0 +1,12 @@
+tumor:
+  ckpt: "weights/unet_tumor_best.pt"
+  input_size: [384, 384]  # 或与你训练一致
+
+
+post:
+  keep_largest_skin: true
+  min_skin_area_ratio: 0.1
+
+severity:
+  count_min_area_px: 20
+  size_bins: [50, 200, 800, 3200]
