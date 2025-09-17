@@ -1,985 +1,729 @@
 # -*- coding: utf-8 -*-
 """
-NF-1 tumor segmentation trainer (Mac MPS 版, + Focal-Tversky, EMA Teacher, TTA)
-- MPS 优先；若不可用退回 CPU
-- YAML 驱动；自动配对 data/{raw,masks_tumor}
-- 支持 resume / auto_resume / init_ckpt（含可选的 allow_partial/strict_arch）
-- Dice 阈值网格搜索（th_min..th_max..th_step）
-- 半监督：EMA Teacher + TTA 伪标签 + warm-up；或退化为学生伪标签
-- 验证可开启 TTA（tta_val: true）
-
-YAML 关键项示例（放在 configs/train.yaml）：
-------------------------------------------------
-data_root: data
-img_dir: raw
-mask_dir: masks_tumor
-
-img_size: 384
-crop_mode: mix           # mix / lesion / random / none
-lesion_p: 0.9
-
-# 损失（三选一；默认 bce_dice）
-loss_type: focal_tversky   # bce_dice | bce_tversky | focal_tversky | combo
-tversky_alpha: 0.3
-tversky_beta: 0.7
-focal_gamma: 0.75
-bce_w: 0.25
-dice_w: 0.75
-
-# 半监督
-unlabeled_dir: unlabeled   # 相对 data_root；或写绝对路径
-unlabeled_batch: 2
-unlabeled_weight: 0.3
-pseudo_thr_high: 0.9
-pseudo_thr_low: 0.1
-ema_decay: 0.999
-ema_eval: true
-ema_warmup_epochs: 5
-tta_val: true
-------------------------------------------------
+NF1 Tumor Segmentation — ResNet50 Attention-UNet + Semi-supervised Mean-Teacher
+- 预训练 ResNet 编码器（RGB + ImageNet 规范化；冻结 BN 统计）
+- 半监督：EMA Teacher + TTA 伪标签 + 双阈/均值门控 + 余弦缓升权重
+- Loss：BCE+Tversky / Focal-Tversky / BCE+Dice（自动估计 pos_weight）
+- LR：线性 Warmup -> 余弦退火；EMA 慢热；Dice 阈值网格搜索；可选 TTA 验证
+目录：
+data/
+ ├─ raw/           # 已标注图像（任意常见格式，RGB/灰度都可）
+ ├─ masks_tumor/   # 同名掩膜（>0 为前景）
+ ├─ unlabeled/     # 未标注图像（可空）
+ └─ splits/        # 可选 train.txt / val.txt（每行一个不含扩展名的文件名）
 """
 
-import os, math, random, argparse, time, copy
+import os, math, time, copy, random, argparse
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Set
 
 import numpy as np
-from PIL import Image
-
-# safetensors（可选）
-try:
-    from safetensors.torch import load_file as safe_load_file, save_file as safe_save_file
-    HAVE_SAFETENSORS = True
-except Exception:
-    HAVE_SAFETENSORS = False
-
-# YAML
-try:
-    import yaml
-except Exception:
-    raise SystemExit("未安装 PyYAML：请先 `pip install pyyaml`。")
+from PIL import Image, ImageOps
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim import AdamW, SGD
+from torch.optim.lr_scheduler import LambdaLR
+from torchvision.models import resnet50, ResNet50_Weights
 
-# -----------------------
-# 小工具
-# -----------------------
-def set_seed(seed=7):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+# ------------------------
+# Config（可用命令行覆盖）
+# ------------------------
+CFG = dict(
+    seed=7,
+    data_root="data",
+    img_dir="raw",
+    mask_dir="masks_tumor",
+    unlabeled_dir="unlabeled",
+    save_dir="runs_nf1_plus",
 
-def _logit(p: float, eps: float = 1e-6) -> float:
-    p = max(min(float(p), 1 - eps), eps)
-    return math.log(p / (1 - p))
+    # 输入与增强
+    img_size=512,
+    flip_p=0.5,
+    rotate90_p=0.5,
+    jitter=0.2,        # 乘法亮度抖动
+    gamma_jitter=0.25, # Gamma 抖动
+    crop_mode="mix",   # none|random|lesion|mix
+    crop_size=320,
+    lesion_p=0.8,
+    cache_images=True,
 
-def _rand_crop_pair(img: torch.Tensor, msk: torch.Tensor, ch: int):
-    _, H, W = img.shape
-    if ch >= H or ch >= W:
-        return img, msk
-    top = random.randint(0, H - ch)
-    left = random.randint(0, W - ch)
-    return img[:, top:top + ch, left:left + ch], msk[:, top:top + ch, left:left + ch]
+    # 训练
+    epochs=300,
+    patience=40,
+    batch=2,
+    unlabeled_batch=2,
+    num_workers=0,     # MPS 建议 0 或 2
+    grad_clip=0.0,
 
-def _lesion_crop_pair(img: torch.Tensor, msk: torch.Tensor, ch: int):
-    _, H, W = img.shape
-    pos = (msk[0] > 0).nonzero(as_tuple=False)  # [N,2] (y,x)
-    if pos.numel() == 0:
-        return _rand_crop_pair(img, msk, ch)
-    yx = pos[random.randint(0, pos.shape[0] - 1)]
-    cy, cx = int(yx[0]), int(yx[1])
-    top = max(0, min(cy - ch // 2, H - ch))
-    left = max(0, min(cx - ch // 2, W - ch))
-    return img[:, top:top + ch, left:left + ch], msk[:, top:top + ch, left:left + ch]
+    # 优化器 & 学习率
+    optimizer="adamw",   # adamw|adam|sgd
+    lr=1e-4,
+    min_lr=1e-6,
+    weight_decay=1e-4,
+    momentum=0.9,        # adam/adamw 用作 beta1
+    nbs=16,              # ref batch for lr scaling
+    lr_warmup_epochs=10,
+    lr_warmup_start=1e-5,
 
+    # Loss 相关
+    loss_type="bce_tversky",  # bce_tversky|focal_tversky|bce_dice
+    bce_w=0.4,
+    dice_w=0.6,
+    tversky_alpha=0.7,
+    tversky_beta=0.3,
+    focal_gamma=0.75,
+    pos_weight_cap=50.0,
+    init_prior_prob=0.08,   # 输出层 bias 先验
 
-# -----------------------
-# 数据读取与配对
-# -----------------------
+    # 体素占比正则（可选）
+    volume_reg_weight=0.0,
+    volume_target=0.0,      # 0=自动用正像素率*1.5 限幅[0.02,0.20]
+
+    # 半监督（EMA Teacher + Pseudo-label）
+    ema_decay=0.995,
+    ema_warmup_epochs=20,
+    ema_eval=True,
+    unlabeled_weight=0.3,
+    unlabeled_ramp_epochs=60,
+    pseudo_thr_high=0.90,
+    pseudo_thr_low=0.10,
+    pseudo_mean_gate=0.50,
+    pseudo_tta=True,        # Teacher 伪标签 TTA
+
+    # 验证 & 阈值搜索
+    tta_val=False,
+    th_min=0.05, th_max=0.95, th_step=0.05,
+)
+
 IMG_EXTS: Set[str] = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
-MSK_EXTS: Set[str] = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+# ------------------------
+# Utils
+# ------------------------
+def set_seed(seed=7):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+
+def pick_device():
+    if torch.backends.mps.is_available(): return torch.device("mps")
+    if torch.cuda.is_available(): return torch.device("cuda")
+    return torch.device("cpu")
+
+def resize_keep_ratio_pad(im: Image.Image, size: int, is_mask: bool):
+    w, h = im.size
+    if w == 0 or h == 0: raise ValueError("空图像")
+    scale = min(size / w, size / h)
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    im = im.resize((nw, nh), Image.NEAREST if is_mask else Image.BILINEAR)
+    pad_w, pad_h = size - nw, size - nh
+    left, right = pad_w // 2, pad_w - pad_w // 2
+    top, bottom = pad_h // 2, pad_h - pad_h // 2
+    return ImageOps.expand(im, border=(left, top, right, bottom), fill=0)
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+
+def pil_to_tensor_rgb_norm(im: Image.Image) -> torch.Tensor:
+    # 保证三通道
+    if im.mode != "RGB": im = im.convert("RGB")
+    arr = np.asarray(im, dtype=np.float32) / 255.0  # HWC
+    x = torch.from_numpy(np.transpose(arr, (2,0,1)))  # CHW
+    return (x - IMAGENET_MEAN) / IMAGENET_STD
+
+def pil_mask_to_tensor(im: Image.Image) -> torch.Tensor:
+    if im.mode != "L": im = im.convert("L")
+    m = np.asarray(im, dtype=np.float32)
+    m = (m > 0).astype(np.float32)
+    return torch.from_numpy(m)[None, ...]
+
+def list_images(folder: Path) -> List[Path]:
+    if not folder.exists(): return []
+    return [p for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower() in IMG_EXTS]
 
 def make_pairs(img_dir: Path, mask_dir: Path) -> Tuple[List[Path], List[Path]]:
-    if not img_dir.exists():
-        raise FileNotFoundError(f"未找到图像目录：{img_dir}")
-    if not mask_dir.exists():
-        raise FileNotFoundError(f"未找到掩膜目录：{mask_dir}")
-
-    imgs = [p for p in sorted(img_dir.iterdir()) if p.suffix.lower() in IMG_EXTS and p.is_file()]
-    if not imgs:
-        raise FileNotFoundError(f"未在 {img_dir} 找到图像文件；支持扩展名：{sorted(IMG_EXTS)}")
-
-    mask_map = {}
-    for p in sorted(mask_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in MSK_EXTS:
-            mask_map[p.stem] = p
-
-    img_paths, mask_paths = [], []
+    imgs = [p for p in sorted(img_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMG_EXTS]
+    mask_map = {p.stem: p for p in sorted(mask_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMG_EXTS}
+    ipaths, mpaths = [], []
     for ip in imgs:
         mp = mask_map.get(ip.stem, None)
         if mp is not None:
-            img_paths.append(ip)
-            mask_paths.append(mp)
+            ipaths.append(ip); mpaths.append(mp)
+    if not ipaths:
+        raise FileNotFoundError(f"在 {img_dir} 和 {mask_dir} 未找到同名 (image, mask) 对")
+    return ipaths, mpaths
 
-    if not img_paths:
-        raise FileNotFoundError(
-            f"在 {img_dir} 与 {mask_dir} 没有找到同名 (image, mask) 对。请确保掩膜与图像同名（仅后缀不同）。"
-        )
-    return img_paths, mask_paths
+def read_split_names(split_dir: Path, name: str) -> List[str]:
+    f = split_dir / name
+    if not f.exists(): return []
+    return [x.strip() for x in open(f, "r", encoding="utf-8") if x.strip()]
 
-def pil_to_array_gray(im: Image.Image) -> np.ndarray:
-    """转单通道 float32 [0,1]"""
-    if im.mode != "L":
-        im = im.convert("L")
-    arr = np.asarray(im, dtype=np.float32)
-    if arr.max() > 1.5:
-        arr /= 255.0
-    return arr
+def logit(p: float, eps: float = 1e-6) -> float:
+    p = max(min(float(p), 1 - eps), eps); return math.log(p/(1-p))
 
-def _resize_pair(im: Image.Image, mk: Image.Image, size: int):
-    im = im.resize((size, size), Image.BILINEAR)
-    mk = mk.resize((size, size), Image.NEAREST)
-    return im, mk
+# ------------------------
+# Dataset
+# ------------------------
+def _rand_crop_pair(img: torch.Tensor, msk: torch.Tensor, ch: int):
+    _, H, W = img.shape
+    if ch >= H or ch >= W: return img, msk
+    top = random.randint(0, H - ch); left = random.randint(0, W - ch)
+    return img[:, top:top+ch, left:left+ch], msk[:, top:top+ch, left:left+ch]
 
-def load_image_mask(img_path: Path, msk_path: Path, size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    im = Image.open(img_path)
-    mk = Image.open(msk_path)
-    im, mk = _resize_pair(im, mk, size)
-    im = pil_to_array_gray(im)  # [H,W] -> [0,1]
-    mk = np.asarray(mk, dtype=np.float32)
-    mk = (mk > 0).astype(np.float32)
-    im_t = torch.from_numpy(im)[None, ...]  # [1,H,W]
-    mk_t = torch.from_numpy(mk)[None, ...]
-    return im_t, mk_t
+def _lesion_crop_pair(img: torch.Tensor, msk: torch.Tensor, ch: int):
+    pos = (msk[0] > 0).nonzero(as_tuple=False)
+    if pos.numel() == 0: return _rand_crop_pair(img, msk, ch)
+    yx = pos[random.randint(0, pos.shape[0] - 1)]
+    cy, cx = int(yx[0]), int(yx[1])
+    _, H, W = img.shape
+    top = max(0, min(cy - ch // 2, H - ch))
+    left = max(0, min(cx - ch // 2, W - ch))
+    return img[:, top:top+ch, left:left+ch], msk[:, top:top+ch, left:left+ch]
 
+class LabeledSet(Dataset):
+    def __init__(self, imgs, msks, cfg):
+        self.imgs, self.msks, self.cfg = imgs, msks, cfg
+        self.size = int(cfg["img_size"])
+        self.flip_p=float(cfg["flip_p"]); self.rotate90_p=float(cfg["rotate90_p"])
+        self.jitter=float(cfg["jitter"]); self.gamma_jitter=float(cfg["gamma_jitter"])
+        self.crop_mode=str(cfg["crop_mode"]); self.crop_size=int(cfg["crop_size"]); self.lesion_p=float(cfg["lesion_p"])
+        self.cache = []
+        if bool(cfg["cache_images"]):
+            for ip, mp in zip(imgs, msks):
+                im = resize_keep_ratio_pad(Image.open(ip), self.size, False)
+                mk = resize_keep_ratio_pad(Image.open(mp), self.size, True)
+                self.cache.append((pil_to_tensor_rgb_norm(im), pil_mask_to_tensor(mk)))
+        else:
+            self.cache=None
 
-class SegDataset(Dataset):
-    def __init__(
-        self,
-        img_paths: List[Path],
-        mask_paths: List[Path],
-        img_size=512,
-        flip_p=0.5,
-        jitter=0.2,
-        rotate90_p=0.5,
-        gamma_jitter=0.25,
-        crop_mode="mix",   # "none" | "lesion" | "random" | "mix"
-        crop_size=256,
-        lesion_p=0.8,
-        cache_images=True,
-    ):
-        self.img_paths = img_paths
-        self.mask_paths = mask_paths
-        self.size = int(img_size)
-        self.flip_p = float(flip_p)
-        self.jitter = float(jitter)
-        self.rotate90_p = float(rotate90_p)
-        self.gamma_jitter = float(gamma_jitter)
-        self.crop_mode = str(crop_mode)
-        self.crop_size = int(crop_size)
-        self.lesion_p = float(lesion_p)
-        self.cache_images = bool(cache_images)
+    def __len__(self): return len(self.imgs)
 
-        self._cache: List[Tuple[torch.Tensor, torch.Tensor]] | None = None
-        if self.cache_images:
-            self._cache = []
-            for ip, mp in zip(self.img_paths, self.mask_paths):
-                img, msk = load_image_mask(ip, mp, self.size)
-                self._cache.append((img, msk))
-
-    def __len__(self):
-        return len(self.img_paths)
-
-    def _get_base(self, i):
-        if self._cache is not None:
-            return self._cache[i][0].clone(), self._cache[i][1].clone()
-        return load_image_mask(self.img_paths[i], self.mask_paths[i], self.size)
+    def _get(self, i):
+        if self.cache is not None:
+            x,y = self.cache[i]; return x.clone(), y.clone()
+        im = resize_keep_ratio_pad(Image.open(self.imgs[i]), self.size, False)
+        mk = resize_keep_ratio_pad(Image.open(self.msks[i]), self.size, True)
+        return pil_to_tensor_rgb_norm(im), pil_mask_to_tensor(mk)
 
     def __getitem__(self, i):
-        img, msk = self._get_base(i)
+        x, y = self._get(i)
+        # 轻量增强（图像/掩膜对齐）
+        if self.flip_p>0 and random.random()<self.flip_p:
+            if random.random()<0.5: x = torch.flip(x,[2]); y = torch.flip(y,[2])
+            else: x = torch.flip(x,[1]); y = torch.flip(y,[1])
+        if self.rotate90_p>0 and random.random()<self.rotate90_p:
+            k = random.randint(0,3)
+            if k: x = torch.rot90(x,k,[1,2]); y = torch.rot90(y,k,[1,2])
+        if self.jitter>0:
+            fac = 1.0 + (random.random()*2-1)*self.jitter
+            x = x*fac
+        if self.gamma_jitter>0:
+            g = 1.0 + (random.random()*2-1)*self.gamma_jitter
+            x = torch.clamp(x, -5, 5)  # 防爆
+            x = torch.sign(x) * (torch.abs(x) ** g)
 
-        # 轻增强
-        if self.flip_p > 0 and random.random() < self.flip_p:
-            if random.random() < 0.5:
-                img = torch.flip(img, dims=[2]); msk = torch.flip(msk, dims=[2])
-            else:
-                img = torch.flip(img, dims=[1]); msk = torch.flip(msk, dims=[1])
-
-        if self.rotate90_p > 0 and random.random() < self.rotate90_p:
-            k = random.randint(0, 3)
-            if k:
-                img = torch.rot90(img, k, dims=[1, 2])
-                msk = torch.rot90(msk, k, dims=[1, 2])
-
-        if self.jitter > 0:
-            fac = 1.0 + (random.random() * 2 - 1) * self.jitter
-            img = torch.clamp(img * fac, 0.0, 1.0)
-
-        if self.gamma_jitter > 0:
-            g = 1.0 + (random.random() * 2 - 1) * self.gamma_jitter
-            img = torch.clamp(img ** g, 0.0, 1.0)
-
-        # 病灶感知/随机裁剪
-        if self.crop_mode != "none" and self.crop_size > 0:
+        if self.crop_mode!="none" and self.crop_size>0:
             ch = min(self.crop_size, self.size)
-            use_lesion = (self.crop_mode == "lesion") or (self.crop_mode == "mix" and random.random() < self.lesion_p)
-            img_c, msk_c = (_lesion_crop_pair(img, msk, ch) if use_lesion else _rand_crop_pair(img, msk, ch))
-            if ch != self.size:
-                img = F.interpolate(img_c.unsqueeze(0), size=(self.size, self.size), mode="bilinear",
-                                    align_corners=False).squeeze(0)
-                msk = F.interpolate(msk_c.unsqueeze(0), size=(self.size, self.size), mode="nearest").squeeze(0)
+            use_les = (self.crop_mode=="lesion") or (self.crop_mode=="mix" and random.random()<self.lesion_p)
+            xc,yc = (_lesion_crop_pair(x,y,ch) if use_les else _rand_crop_pair(x,y,ch))
+            if ch!=self.size:
+                x = F.interpolate(xc.unsqueeze(0), size=(self.size,self.size), mode="bilinear", align_corners=False).squeeze(0)
+                y = F.interpolate(yc.unsqueeze(0), size=(self.size,self.size), mode="nearest").squeeze(0)
             else:
-                img, msk = img_c, msk_c
+                x,y = xc,yc
+        return x, y
 
-        return img, msk
+class UnlabeledSet(Dataset):
+    def __init__(self, imgs, cfg):
+        self.imgs, self.cfg = imgs, cfg
+        self.size=int(cfg["img_size"])
+        self.flip_p=float(cfg["flip_p"]); self.rotate90_p=float(cfg["rotate90_p"])
+        self.jitter=float(cfg["jitter"]); self.gamma_jitter=float(cfg["gamma_jitter"])
+        self.crop_mode=str(cfg["crop_mode"]); self.crop_size=int(cfg["crop_size"])
+        self.cache=[]
+        if bool(cfg["cache_images"]):
+            for ip in imgs:
+                im = resize_keep_ratio_pad(Image.open(ip), self.size, False)
+                self.cache.append(pil_to_tensor_rgb_norm(im))
+        else: self.cache=None
 
+    def __len__(self): return len(self.imgs)
 
-# ====== 未标注数据集 ======
-class UnlabeledDataset(Dataset):
-    """未标注图像：仅输出 img，增强策略与有标注保持一致（去掉基于掩膜的病灶裁剪）"""
-    def __init__(self, img_paths: List[Path], img_size=512,
-                 flip_p=0.5, jitter=0.2, rotate90_p=0.5, gamma_jitter=0.25,
-                 crop_mode="mix", crop_size=256, lesion_p=0.8, cache_images=True):
-        self.img_paths = img_paths
-        self.size = int(img_size)
-        self.flip_p = float(flip_p)
-        self.jitter = float(jitter)
-        self.rotate90_p = float(rotate90_p)
-        self.gamma_jitter = float(gamma_jitter)
-        self.crop_mode = str(crop_mode)
-        self.crop_size = int(crop_size)
-        self.lesion_p = float(lesion_p)
-        self.cache_images = bool(cache_images)
-
-        self._cache: List[torch.Tensor] | None = None
-        if self.cache_images:
-            self._cache = []
-            for ip in self.img_paths:
-                im = Image.open(ip)
-                im = im.resize((self.size, self.size), Image.BILINEAR)
-                arr = pil_to_array_gray(im)
-                self._cache.append(torch.from_numpy(arr)[None, ...])
-
-    def __len__(self):
-        return len(self.img_paths)
-
-    def _get_base(self, i):
-        if self._cache is not None:
-            return self._cache[i].clone()
-        im = Image.open(self.img_paths[i])
-        im = im.resize((self.size, self.size), Image.BILINEAR)
-        arr = pil_to_array_gray(im)
-        return torch.from_numpy(arr)[None, ...]
+    def _get(self, i):
+        if self.cache is not None:
+            return self.cache[i].clone()
+        im = resize_keep_ratio_pad(Image.open(self.imgs[i]), self.size, False)
+        return pil_to_tensor_rgb_norm(im)
 
     def __getitem__(self, i):
-        img = self._get_base(i)
-
-        # 轻增强
-        if self.flip_p > 0 and random.random() < self.flip_p:
-            img = torch.flip(img, dims=[2] if random.random() < 0.5 else [1])
-
-        if self.rotate90_p > 0 and random.random() < self.rotate90_p:
-            k = random.randint(0, 3)
-            if k:
-                img = torch.rot90(img, k, dims=[1, 2])
-
-        if self.jitter > 0:
-            fac = 1.0 + (random.random() * 2 - 1) * self.jitter
-            img = torch.clamp(img * fac, 0.0, 1.0)
-
-        if self.gamma_jitter > 0:
-            g = 1.0 + (random.random() * 2 - 1) * self.gamma_jitter
-            img = torch.clamp(img ** g, 0.0, 1.0)
-
-        # 随机裁剪
-        if self.crop_mode != "none" and self.crop_size > 0:
+        x = self._get(i)
+        if self.flip_p>0 and random.random()<self.flip_p:
+            x = torch.flip(x, dims=[2] if random.random()<0.5 else [1])
+        if self.rotate90_p>0 and random.random()<self.rotate90_p:
+            k = random.randint(0,3)
+            if k: x = torch.rot90(x,k,[1,2])
+        if self.jitter>0:
+            fac = 1.0 + (random.random()*2-1)*self.jitter
+            x = x*fac
+        if self.gamma_jitter>0:
+            g = 1.0 + (random.random()*2-1)*self.gamma_jitter
+            x = torch.clamp(x, -5, 5)
+            x = torch.sign(x) * (torch.abs(x) ** g)
+        if self.crop_mode!="none" and self.crop_size>0:
             ch = min(self.crop_size, self.size)
-            img_c, _ = _rand_crop_pair(img, img.new_zeros(1, *img.shape[-2:]), ch)
-            if ch != self.size:
-                img = F.interpolate(img_c.unsqueeze(0), size=(self.size, self.size),
-                                    mode="bilinear", align_corners=False).squeeze(0)
-            else:
-                img = img_c
-        return img
+            xc,_ = _rand_crop_pair(x, x.new_zeros(1,*x.shape[-2:]), ch)
+            if ch!=self.size:
+                x = F.interpolate(xc.unsqueeze(0), size=(self.size,self.size), mode="bilinear", align_corners=False).squeeze(0)
+            else: x = xc
+        return x
 
-
-# -----------------------
-# 模型：轻量 UNet
-# -----------------------
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch, norm="gn", groups=8, drop=0.0):
+# ------------------------
+# Model: ResNet50 Encoder + Attention U-Net Decoder
+# ------------------------
+class AttentionGate(nn.Module):
+    def __init__(self, in_ch_skip, in_ch_g, inter_ch):
         super().__init__()
-        Norm = (lambda c: nn.GroupNorm(groups, c)) if norm == "gn" else (lambda c: nn.BatchNorm2d(c))
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            Norm(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            Norm(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(drop) if drop > 0 else nn.Identity(),
+        self.theta_x = nn.Conv2d(in_ch_skip, inter_ch, kernel_size=1, bias=False)
+        self.phi_g   = nn.Conv2d(in_ch_g,   inter_ch, kernel_size=1, bias=False)
+        self.psi     = nn.Conv2d(inter_ch, 1, kernel_size=1)
+        self.bn      = nn.BatchNorm2d(inter_ch)
+        self.act     = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x, g):
+        # x: skip, g: gating (decoder feature)
+        theta = self.theta_x(x)
+        phi   = self.phi_g(g)
+        if theta.shape[-2:] != phi.shape[-2:]:
+            phi = F.interpolate(phi, size=theta.shape[-2:], mode="bilinear", align_corners=False)
+        f = self.act(self.bn(theta + phi))
+        att = self.sigmoid(self.psi(f))
+        return x * att
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, use_att=True):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.use_att = use_att and (skip_ch>0)
+        if self.use_att:
+            self.ag = AttentionGate(skip_ch, out_ch, inter_ch=max(out_ch//2, 32))
+        conv_in = out_ch + (skip_ch if self.use_att else 0)
+        self.conv = nn.Sequential(
+            nn.Conv2d(conv_in, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
         )
+    def forward(self, x, skip=None):
+        x = self.up(x)
+        if skip is not None:
+            if x.shape[-2:] != skip.shape[-2:]:
+                x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            if self.use_att:
+                skip = self.ag(skip, x)
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
-    def forward(self, x):
-        return self.net(x)
-
-class UNet(nn.Module):
-    def __init__(self, in_ch=1, base=16, depth=4, norm="gn", drop=0.05):
+class ResNetAttentionUNet(nn.Module):
+    def __init__(self, num_classes=1, pretrained=True, freeze_bn=True):
         super().__init__()
-        chs = [base * (2 ** i) for i in range(depth)]
-        self.downs = nn.ModuleList()
-        self.pools = nn.ModuleList()
-        c_in = in_ch
-        for c in chs:
-            self.downs.append(DoubleConv(c_in, c, norm=norm, drop=drop))
-            self.pools.append(nn.MaxPool2d(2))
-            c_in = c
-        self.center = DoubleConv(chs[-1], chs[-1] * 2, norm=norm, drop=drop)
+        weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        encoder = resnet50(weights=weights)
 
-        self.ups = nn.ModuleList()
-        c = chs[-1] * 2
-        for dc in reversed(chs):
-            self.ups.append(nn.ConvTranspose2d(c, dc, kernel_size=2, stride=2))
-            self.ups.append(DoubleConv(c if dc == chs[-1] else dc * 2, dc, norm=norm, drop=drop))
-            c = dc
-        self.out_conv = nn.Conv2d(base, 1, 1)
+        # Encoder outputs
+        self.conv1 = nn.Sequential(encoder.conv1, encoder.bn1, encoder.relu)  # C=64, /2
+        self.pool  = encoder.maxpool
+        self.layer1 = encoder.layer1  # C=256, /4
+        self.layer2 = encoder.layer2  # C=512, /8
+        self.layer3 = encoder.layer3  # C=1024, /16
+        self.layer4 = encoder.layer4  # C=2048, /32
+
+        # 冻结 BN 统计，避免小 batch 震荡
+        if freeze_bn:
+            self._freeze_bn(self)
+
+        # Center 1x1 降维
+        self.center = nn.Conv2d(2048, 1024, kernel_size=1)
+
+        # Decoder with attention
+        self.dec4 = DecoderBlock(1024, 1024, 512, use_att=True)  # skip=layer3
+        self.dec3 = DecoderBlock(512,  512,  256, use_att=True)  # skip=layer2
+        self.dec2 = DecoderBlock(256,  256,  128, use_att=True)  # skip=layer1
+        self.dec1 = DecoderBlock(128,   64,   64, use_att=True)  # skip=conv1
+
+        self.out_conv = nn.Conv2d(64, num_classes, kernel_size=1)
+
+    @staticmethod
+    def _freeze_bn(module):
+        for m in module.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+                for p in m.parameters(): p.requires_grad_(False)
 
     def forward(self, x):
-        feats = []
-        for down, pool in zip(self.downs, self.pools):
-            x = down(x)
-            feats.append(x)
-            x = pool(x)
-        x = self.center(x)
-        for i in range(0, len(self.ups), 2):
-            up = self.ups[i]
-            dc = self.ups[i + 1]
-            x = up(x)
-            skip = feats[-(i // 2 + 1)]
-            # pad if needed
-            if x.shape[-1] != skip.shape[-1] or x.shape[-2] != skip.shape[-2]:
-                dh = skip.shape[-2] - x.shape[-2]
-                dw = skip.shape[-1] - x.shape[-1]
-                x = F.pad(x, [0, max(0, dw), 0, max(0, dh)])
-                x = x[:, :, : skip.shape[-2], : skip.shape[-1]]
-            x = torch.cat([skip, x], dim=1)
-            x = dc(x)
-        return self.out_conv(x)
+        x0 = self.conv1(x)         # 64,  /2
+        x1 = self.layer1(self.pool(x0))  # 256, /4
+        x2 = self.layer2(x1)       # 512, /8
+        x3 = self.layer3(x2)       # 1024,/16
+        x4 = self.layer4(x3)       # 2048,/32
 
+        c  = self.center(x4)
+        d4 = self.dec4(c,  x3)
+        d3 = self.dec3(d4, x2)
+        d2 = self.dec2(d3, x1)
+        d1 = self.dec1(d2, x0)
 
-# -----------------------
-# 损失 & 指标
-# -----------------------
-def soft_dice_prob(prob: torch.Tensor, target: torch.Tensor, eps=1e-6):
-    inter = (prob * target).sum(dim=(1, 2, 3))
-    union = prob.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-    return ((2 * inter + eps) / (union + eps)).mean()
+        logit = self.out_conv(d1)
+        # 补齐至输入大小
+        logit = F.interpolate(logit, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return logit
 
-# === Tversky / Focal-Tversky / Combo ===
-def tversky_loss(prob: torch.Tensor, target: torch.Tensor, alpha=0.3, beta=0.7, eps=1e-6):
-    tp = (prob * target).sum(dim=(1,2,3))
-    fp = (prob * (1 - target)).sum(dim=(1,2,3))
-    fn = ((1 - prob) * target).sum(dim=(1,2,3))
-    t = (tp + eps) / (tp + alpha*fp + beta*fn + eps)
+# ------------------------
+# Loss & Metrics
+# ------------------------
+def soft_dice(prob: torch.Tensor, tgt: torch.Tensor, eps=1e-6):
+    inter = (prob*tgt).sum(dim=(1,2,3))
+    union = prob.sum(dim=(1,2,3)) + tgt.sum(dim=(1,2,3))
+    return ((2*inter + eps) / (union + eps)).mean()
+
+def tversky_loss(prob, tgt, alpha=0.7, beta=0.3, eps=1e-6):
+    tp = (prob*tgt).sum((1,2,3))
+    fp = (prob*(1-tgt)).sum((1,2,3))
+    fn = ((1-prob)*tgt).sum((1,2,3))
+    t  = (tp+eps)/(tp + alpha*fp + beta*fn + eps)
     return (1 - t).mean()
 
-def focal_tversky_loss(prob: torch.Tensor, target: torch.Tensor, alpha=0.3, beta=0.7, gamma=0.75):
-    lt = tversky_loss(prob, target, alpha=alpha, beta=beta)
-    return torch.pow(lt, gamma)
-
-def combo_loss(logits: torch.Tensor, target: torch.Tensor, bce_w=0.25, t_alpha=0.3, t_beta=0.7):
-    bce = F.binary_cross_entropy_with_logits(logits, target)
+def compute_loss(logits, tgt, cfg, pos_weight_t):
     prob = torch.sigmoid(logits)
-    tv = tversky_loss(prob, target, alpha=t_alpha, beta=t_beta)
-    return bce_w*bce + (1.0-bce_w)*tv
+    lt = str(cfg["loss_type"]).lower()
+    if lt == "focal_tversky":
+        base = tversky_loss(prob, tgt, alpha=float(cfg["tversky_alpha"]), beta=float(cfg["tversky_beta"]))
+        return torch.pow(base, float(cfg["focal_gamma"]))
+    if lt == "bce_tversky":
+        bce = F.binary_cross_entropy_with_logits(logits, tgt, pos_weight=pos_weight_t)
+        tv  = tversky_loss(prob, tgt, alpha=float(cfg["tversky_alpha"]), beta=float(cfg["tversky_beta"]))
+        return float(cfg["bce_w"])*bce + float(cfg["dice_w"])*tv
+    # bce_dice
+    bce = F.binary_cross_entropy_with_logits(logits, tgt, pos_weight=pos_weight_t)
+    dice = soft_dice(prob, tgt)
+    return float(cfg["bce_w"])*bce + float(cfg["dice_w"])*(1 - dice)
 
-def compute_loss(logits: torch.Tensor, target: torch.Tensor, cfg: Dict[str, Any], pos_weight_t: torch.Tensor):
-    loss_type = str(cfg.get("loss_type", "bce_dice")).lower()
-    prob = torch.sigmoid(logits)
+def volume_regularizer(prob: torch.Tensor, target_ratio: float, w: float):
+    if w <= 0: return prob.new_zeros(())
+    pred_ratio = prob.mean(dim=(1,2,3))
+    return w * (pred_ratio - target_ratio).pow(2).mean()
 
-    if loss_type == "focal_tversky":
-        alpha = float(cfg.get("tversky_alpha", 0.3))
-        beta  = float(cfg.get("tversky_beta",  0.7))
-        gamma = float(cfg.get("focal_gamma",   0.75))
-        return focal_tversky_loss(prob, target, alpha=alpha, beta=beta, gamma=gamma)
-
-    if loss_type == "bce_tversky":
-        alpha = float(cfg.get("tversky_alpha", 0.3))
-        beta  = float(cfg.get("tversky_beta",  0.7))
-        bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight_t)
-        tv  = tversky_loss(prob, target, alpha=alpha, beta=beta)
-        w_bce = float(cfg.get("bce_w", 0.3)); w_tv = float(cfg.get("dice_w", 0.7))
-        return w_bce*bce + w_tv*tv
-
-    if loss_type == "combo":
-        return combo_loss(logits, target,
-                          bce_w=float(cfg.get("bce_w", 0.25)),
-                          t_alpha=float(cfg.get("tversky_alpha", 0.3)),
-                          t_beta=float(cfg.get("tversky_beta", 0.7)))
-
-    # 默认：bce + dice
-    bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight_t)
-    dice_soft = soft_dice_prob(prob, target)
-    return float(cfg.get("bce_w", 0.3)) * bce + float(cfg.get("dice_w", 0.7)) * (1 - dice_soft)
-
-def compute_pos_weight(dloader: DataLoader, cap=50.0, max_batches=50, device="cpu"):
-    """估计像素级正样本比例 -> pos_weight = (1-p)/p (上限cap)"""
+@torch.no_grad()
+def compute_pos_weight(loader, cap=50.0, max_batches=25, device="cpu"):
     pos, tot, n = 0.0, 0.0, 0
-    for _, y in dloader:
+    for _,y in loader:
         y = y.to(device)
         pos += y.sum().item()
         tot += y.numel()
         n += 1
-        if n >= max_batches:
-            break
-    p = max(pos / max(1.0, tot), 1e-6)
-    raw = (1.0 - p) / p
+        if n>=max_batches: break
+    p = max(pos/max(1.0, tot), 1e-6)
+    raw = (1.0 - p)/p
     return min(cap, raw), p
 
-
-# -----------------------
+# ------------------------
 # EMA / TTA
-# -----------------------
+# ------------------------
 def copy_model(model: nn.Module):
-    ema = copy.deepcopy(model)
-    ema.eval()
-    for p in ema.parameters():
-        p.requires_grad_(False)
+    ema = copy.deepcopy(model); ema.eval()
+    for p in ema.parameters(): p.requires_grad_(False)
     return ema
 
 @torch.no_grad()
 def ema_update(ema: nn.Module, model: nn.Module, decay: float):
-    esd = ema.state_dict()
-    msd = model.state_dict()
+    esd = ema.state_dict(); msd = model.state_dict()
     for k in esd.keys():
         if k in msd and esd[k].dtype == msd[k].dtype:
             esd[k].lerp_(msd[k], 1.0 - decay)
     ema.load_state_dict(esd, strict=False)
 
 @torch.no_grad()
-def predict_proba_tta(net, x: torch.Tensor):
-    # 5 个视图：原图 + Hflip + 3*旋转
+def predict_tta(net, x):
     probs = []
-    p = torch.sigmoid(net(x)); probs.append(p)
-    x1 = torch.flip(x, dims=[-1]); probs.append(torch.sigmoid(net(x1)).flip(dims=[-1]))
-    x2 = torch.rot90(x, 1, dims=[-2,-1]); probs.append(torch.rot90(torch.sigmoid(net(x2)), -1, dims=[-2,-1]))
-    x3 = torch.rot90(x, 2, dims=[-2,-1]); probs.append(torch.rot90(torch.sigmoid(net(x3)), -2, dims=[-2,-1]))
-    x4 = torch.rot90(x, 3, dims=[-2,-1]); probs.append(torch.rot90(torch.sigmoid(net(x4)), -3, dims=[-2,-1]))
-    return torch.stack(probs, dim=0).mean(0)
+    p0 = torch.sigmoid(net(x)); probs.append(p0)
+    x1 = torch.flip(x, [-1]);        probs.append(torch.sigmoid(net(x1)).flip([-1]))
+    x2 = torch.rot90(x, 1, [2,3]);   probs.append(torch.rot90(torch.sigmoid(net(x2)), -1, [2,3]))
+    x3 = torch.rot90(x, 2, [2,3]);   probs.append(torch.rot90(torch.sigmoid(net(x3)), -2, [2,3]))
+    x4 = torch.rot90(x, 3, [2,3]);   probs.append(torch.rot90(torch.sigmoid(net(x4)), -3, [2,3]))
+    return torch.stack(probs, 0).mean(0)
 
-def cosine_warmup(epoch, max_w, warmup_epochs=5):
-    if warmup_epochs <= 0:
-        return max_w
-    if epoch <= warmup_epochs:
-        return max_w * epoch / max(1, warmup_epochs)
-    return max_w
-
-
-# -----------------------
-# 训练（MPS 友好）
-# -----------------------
-def run_epoch(net, loader, optimizer, device, cfg, pos_weight_t, grad_clip=0.0,
-              unl_iter=None, ema_model=None, ema_decay=0.0,
-              epoch=1, warmup_epochs=5):
-    net.train()
-    losses = []
-    lambda_u_max = float(cfg.get("unlabeled_weight", 0.0))
-    lam_u = cosine_warmup(epoch, lambda_u_max, warmup_epochs=warmup_epochs)
-    th_h = float(cfg.get("pseudo_thr_high", 0.9))
-    th_l = float(cfg.get("pseudo_thr_low", 0.1))
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=False)
-        y = y.to(device, non_blocking=False)
-        optimizer.zero_grad(set_to_none=True)
-
-        # 有标注监督损失
-        logits = net(x)
-        loss_sup = compute_loss(logits, y, cfg, pos_weight_t)
-
-        # 无标注：EMA Teacher + TTA 伪标签
-        loss_unsup = x.new_zeros(())
-        if (unl_iter is not None) and (lam_u > 0.0):
-            try:
-                x_u = next(unl_iter)
-            except StopIteration:
-                x_u = None
-            if x_u is not None:
-                x_u = x_u.to(device, non_blocking=False)
-                with torch.no_grad():
-                    if ema_model is not None:
-                        p_teacher = predict_proba_tta(ema_model, x_u)
-                    else:
-                        p_teacher = torch.sigmoid(net(x_u))
-                    conf_mask = ((p_teacher >= th_h) | (p_teacher <= th_l)).float()
-                    pseudo = (p_teacher > 0.5).float()
-                logits_u = net(x_u)
-                bce_pix = F.binary_cross_entropy_with_logits(logits_u, pseudo, reduction="none")
-                denom = conf_mask.sum().clamp_min(1.0)
-                loss_unsup = (bce_pix * conf_mask).sum() / denom
-
-        loss = loss_sup + lam_u * loss_unsup
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-        optimizer.step()
-
-        # EMA 每步更新
-        if ema_model is not None and ema_decay > 0:
-            ema_update(ema_model, net, decay=ema_decay)
-
-        losses.append(float(loss.item()))
-    return float(np.mean(losses))
-
-
-@torch.no_grad()
-def evaluate_once(net, loader, device, cfg: Dict[str, Any], pos_weight_t: torch.Tensor,
-                  th_min: float, th_max: float, th_step: float):
-    net.eval()
-    eps = 1e-6
-    thresholds = np.arange(th_min, th_max + 1e-9, th_step).astype(np.float32).tolist()
-
-    # ✅ MPS 不支持 float64，统一用 float32
-    dtype_accum = torch.float32
-
-    total_loss = 0.0
-    n_batches = 0
-
-    inter = torch.zeros(len(thresholds), dtype=dtype_accum, device=device)
-    pred_sum = torch.zeros(len(thresholds), dtype=dtype_accum, device=device)
-    tgt_sum = torch.zeros((), dtype=dtype_accum, device=device)
-
-    pred_pos_list, prob_mean_list = [], []
-    empty_gt_cnt, sample_cnt = 0, 0
-
-    use_tta = bool(cfg.get("tta_val", False))
-
-    for x, y in loader:
-        x = x.to(device); y = y.to(device)
-
-        logits = net(x)  # 用于 val_loss（不做 TTA）
-        loss = compute_loss(logits, y, cfg, pos_weight_t)
-        total_loss += float(loss.item()); n_batches += 1
-
-        # 用 TTA 的概率来做 Dice/阈值搜索（若开启）
-        prob = predict_proba_tta(net, x) if use_tta else torch.sigmoid(logits)
-
-        pred_pos_list.append((prob > 0.5).float().mean().item())
-        prob_mean_list.append(prob.mean().item())
-        empty_gt_cnt += (y.sum(dim=(1, 2, 3)) == 0).sum().item()
-        sample_cnt += y.size(0)
-
-        tgt_sum += y.sum(dtype=dtype_accum)
-        for i, th in enumerate(thresholds):
-            pred = (prob > th).to(torch.float32)
-            inter[i] += (pred * y).sum(dtype=dtype_accum)
-            pred_sum[i] += pred.sum(dtype=dtype_accum)
-
-    union = pred_sum + tgt_sum + eps
-    dice_all = (2.0 * inter + eps) / union
-    best_idx = int(torch.argmax(dice_all).item())
-    best_dice = float(dice_all[best_idx].item())
-    best_thr = float(thresholds[best_idx])
-    val_loss = float(total_loss / max(1, n_batches))
-
-    metrics = {
-        "pred_pos@0.5": float(np.mean(pred_pos_list)) if pred_pos_list else 0.0,
-        "prob_mean": float(np.mean(prob_mean_list)) if prob_mean_list else 0.0,
-        "empty_gt_ratio": float(empty_gt_cnt / max(1, sample_cnt)),
-    }
-    return val_loss, best_dice, best_thr, metrics
-
-
-# -----------------------
-# 保存/加载（严格匹配可配置）
-# -----------------------
-def save_ckpt(path, model, optimizer, scheduler, epoch, best_dice, best_thr, args_dict):
-    os.makedirs(Path(path).parent, exist_ok=True)
-    ckpt = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
-        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "epoch": epoch,
-        "best_dice": best_dice,
-        "best_thr": best_thr,
-        "args": args_dict,
-    }
-    torch.save(ckpt, path)
-
-def _load_state(model: nn.Module, state_dict: Dict[str, torch.Tensor],
-                allow_partial: bool, strict_arch: bool):
-    model_state = model.state_dict()
-    matched, skipped = {}, []
-    for k, v in state_dict.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            matched[k] = v
-        else:
-            skipped.append(k)
-
-    if (not allow_partial) or strict_arch:
-        if skipped:
-            raise RuntimeError(f"[严格匹配] 发现 {len(skipped)} 个不匹配参数，终止加载（设置 allow_partial:true 或 strict_arch:false 可放宽）。")
-        model.load_state_dict(state_dict, strict=True)
-        return 0
-
-    # allow_partial
-    model_state.update(matched)
-    model.load_state_dict(model_state, strict=False)
-    if skipped:
-        print(f"[warn] 部分加载：跳过 {len(skipped)} 个不匹配参数")
-    return len(skipped)
-
-def _torch_load_any(path, map_location):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-def load_any_weights(path, model, optimizer=None, scheduler=None,
-                     map_location="cpu", allow_partial=False, strict_arch=True):
-    path = str(path)
-    ext = Path(path).suffix.lower()
-    if ext == ".safetensors":
-        if not HAVE_SAFETENSORS:
-            raise SystemExit("未安装 safetensors：`pip install safetensors` 后再用 .safetensors")
-        sd = safe_load_file(path, device=map_location)
-        _load_state(model, sd, allow_partial=allow_partial, strict_arch=strict_arch)
-        return "model-only(safetensors)", None
-
-    obj = _torch_load_any(path, map_location=map_location)
-
-    if isinstance(obj, dict) and "model" in obj:
-        _load_state(model, obj["model"], allow_partial=allow_partial, strict_arch=strict_arch)
-        if optimizer is not None and obj.get("optimizer") is not None:
-            optimizer.load_state_dict(obj["optimizer"])
-        if scheduler is not None and obj.get("scheduler") is not None:
-            try:
-                scheduler.load_state_dict(obj["scheduler"])
-            except Exception as e:
-                print(f"[warn] 调度器状态恢复失败：{e}")
-        return "full", obj
-
-    if isinstance(obj, dict):
-        _load_state(model, obj, allow_partial=allow_partial, strict_arch=strict_arch)
-        return "model-only", None
-
-    raise RuntimeError(f"无法识别的权重格式：{path}")
-
-
-# -----------------------
-# YAML 配置读取
-# -----------------------
-DEFAULT_CFG_REL = Path(__file__).resolve().parents[1] / "configs" / "train.yaml"
-
-def load_config(path_from_cli: str | None) -> dict:
-    if path_from_cli:
-        cfg_path = Path(path_from_cli)
+# ------------------------
+# Optimizer & LR
+# ------------------------
+def build_opt_sched(net: nn.Module, cfg: Dict[str,Any], epochs: int):
+    opt_type = str(cfg["optimizer"]).lower()
+    base_lr = float(cfg["lr"]); min_lr=float(cfg["min_lr"]); wd=float(cfg["weight_decay"])
+    momentum=float(cfg["momentum"]); warm=int(cfg["lr_warmup_epochs"])
+    nbs=int(cfg["nbs"]); batch=int(cfg["batch"])
+    # 按 batch 线性缩放（与 TF 经验一致）
+    if opt_type in ["adam", "adamw"]:
+        lr_limit_max, lr_limit_min = 1e-4, 1e-4
     else:
-        cfg_path = DEFAULT_CFG_REL
-    if not cfg_path.exists():
-        raise SystemExit(f"未提供 --config，且默认配置不存在：{cfg_path}\n"
-                         f"请创建该文件，或通过 --config 指定配置路径。")
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    print(f"[CFG] 已加载配置：{cfg_path}")
-    return cfg
+        lr_limit_max, lr_limit_min = 1e-1, 5e-4
+    base_lr_scaled = min(max(batch/nbs*base_lr, lr_limit_min), lr_limit_max)
+    min_lr_scaled  = min(max(batch/nbs*min_lr,  lr_limit_min*1e-2), lr_limit_max*1e-2)
+    if opt_type == "sgd":
+        optimizer = SGD(net.parameters(), lr=base_lr_scaled, momentum=momentum, nesterov=True, weight_decay=wd)
+    elif opt_type == "adam":
+        optimizer = torch.optim.Adam(net.parameters(), lr=base_lr_scaled, betas=(momentum,0.999), weight_decay=wd)
+    else:
+        optimizer = AdamW(net.parameters(), lr=base_lr_scaled, weight_decay=wd)
+    def lr_lambda(ep):
+        if ep < warm:
+            start=float(cfg["lr_warmup_start"])
+            alpha=(ep+1)/max(1,warm)
+            return (start + (base_lr_scaled-start)*alpha)/base_lr_scaled
+        prog=(ep-warm)/max(1, epochs-warm)
+        cosine=0.5*(1+math.cos(math.pi*min(1.0,max(0.0,prog))))
+        lr_now=min_lr_scaled + (base_lr_scaled-min_lr_scaled)*cosine
+        return lr_now/base_lr_scaled
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    return optimizer, scheduler, base_lr_scaled, min_lr_scaled
 
+# ------------------------
+# Evaluate
+# ------------------------
+@torch.no_grad()
+def evaluate(net, loader, device, cfg, pos_weight_t):
+    net.eval()
+    ths = np.arange(float(cfg["th_min"]), float(cfg["th_max"])+1e-9, float(cfg["th_step"]), dtype=np.float32).tolist()
+    inter_acc = torch.zeros(len(ths), device=device); pred_sum_acc=torch.zeros(len(ths), device=device)
+    tgt_sum_acc = torch.zeros((), device=device)
+    total_loss, nb = 0.0, 0
+    dice_list=[]
+    for x,y in loader:
+        x=x.to(device); y=y.to(device)
+        logits = net(x)  # 验证损失不用 TTA
+        loss = compute_loss(logits,y,cfg,pos_weight_t)
+        total_loss += float(loss.item()); nb += 1
 
-# -----------------------
-# 主训练入口（MPS）
-# -----------------------
-def main(cfg: dict):
-    # 1) 随机种子
-    set_seed(int(cfg.get("seed", 7)))
+        prob = predict_tta(net,x) if bool(cfg["tta_val"]) else torch.sigmoid(logits)
+        dice_list.append(soft_dice(prob,y).item())
 
-    # 2) 设备（仅 MPS；若不可用则退回 CPU）
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        tgt_sum_acc += y.sum()
+        for i,th in enumerate(ths):
+            pred = (prob>th).to(torch.float32)
+            inter_acc[i] += (pred*y).sum()
+            pred_sum_acc[i] += pred.sum()
 
-    # 3) 数据路径
-    data_root = Path(cfg.get("data_root", "data"))
-    img_dir_cfg = Path(cfg.get("img_dir", "raw"))
-    mask_dir_cfg = Path(cfg.get("mask_dir", "masks_tumor"))
-    img_dir = img_dir_cfg if img_dir_cfg.is_absolute() else data_root / img_dir_cfg
-    mask_dir = mask_dir_cfg if mask_dir_cfg.is_absolute() else data_root / mask_dir_cfg
+    eps=1e-6
+    dice_all = (2.0*inter_acc + eps)/(pred_sum_acc + tgt_sum_acc + eps)
+    best_idx = int(torch.argmax(dice_all).item())
+    best_dice = float(dice_all[best_idx].item()); best_thr=float(ths[best_idx])
+    val_loss = float(total_loss/max(1,nb))
+    return val_loss, best_dice, best_thr, dict(avg_dice=float(np.mean(dice_list)) if dice_list else 0.0)
+
+# ------------------------
+# Train
+# ------------------------
+def train(cfg):
+    set_seed(int(cfg["seed"]))
+    device = pick_device()
+
+    root = Path(cfg["data_root"])
+    img_dir = root / cfg["img_dir"]; mask_dir=root / cfg["mask_dir"]; unl_dir=root / cfg["unlabeled_dir"]
+    split_dir = root / "splits"
 
     img_paths, mask_paths = make_pairs(img_dir, mask_dir)
 
-    # 过拟合自检（可选）
-    overfit_k = int(cfg.get("overfit_k", 0))
-    if overfit_k > 0:
-        img_paths = img_paths[: overfit_k]
-        mask_paths = mask_paths[: overfit_k]
-
-    # 4) 划分 train/val
-    val_split = float(cfg.get("val_split", 0.2))
-    idxs = list(range(len(img_paths)))
-    random.shuffle(idxs)
-    n_total = len(idxs)
-    n_val = max(1, int(n_total * (0.25 if overfit_k > 0 else val_split)))
-    val_ids = set(idxs[:n_val])
-    train_ids = [i for i in idxs if i not in val_ids]
-
-    if bool(cfg.get("overfit_val_on_train", False)):
-        train_ids = idxs
-        val_ids = set(idxs)
-
-    train_img = [img_paths[i] for i in train_ids]
-    train_msk = [mask_paths[i] for i in train_ids]
-    val_img = [img_paths[i] for i in val_ids]
-    val_msk = [mask_paths[i] for i in val_ids]
-
-    print(f"数据统计：total={n_total} | train={len(train_img)} val={len(val_img)} | device={device.type} | "
-          f"dirs=({img_dir.name}, {mask_dir.name})")
-
-    # 5) 数据集 / DataLoader
-    img_size = int(cfg.get("img_size", 384))
-    ds_tr = SegDataset(
-        train_img, train_msk,
-        img_size=img_size,
-        flip_p=float(cfg.get("flip_p", 0.5)),
-        jitter=float(cfg.get("jitter", 0.2)),
-        rotate90_p=float(cfg.get("rotate90_p", 0.5)),
-        gamma_jitter=float(cfg.get("gamma_jitter", 0.25)),
-        crop_mode=str(cfg.get("crop_mode", "mix")),
-        crop_size=int(cfg.get("crop_size", max(128, img_size // 2))),
-        lesion_p=float(cfg.get("lesion_p", 0.8)),
-        cache_images=bool(cfg.get("cache_images", True)),
-    )
-    ds_va = SegDataset(
-        val_img, val_msk,
-        img_size=img_size,
-        flip_p=0.0, jitter=0.0, rotate90_p=0.0, gamma_jitter=0.0,
-        crop_mode="none", crop_size=0, lesion_p=0.0,
-        cache_images=bool(cfg.get("cache_images", True)),
-    )
-
-    batch = int(cfg.get("batch", 2))
-    num_workers = int(cfg.get("num_workers", 0))   # MPS 上建议 0 或 2；过大反而慢
-    pin_mem = False
-    dl_tr = DataLoader(ds_tr, batch_size=batch, shuffle=True,
-                       num_workers=num_workers, pin_memory=pin_mem)
-    dl_va = DataLoader(ds_va, batch_size=max(1, batch * 2), shuffle=False,
-                       num_workers=num_workers, pin_memory=pin_mem)
-
-    # 6) 估计 BCE pos_weight
-    pos_cap = float(cfg.get("pos_weight_cap", 20.0))
-    est_dl = DataLoader(ds_tr, batch_size=max(1, batch * 2), shuffle=False, num_workers=0)
-    pos_w_val, pos_ratio = compute_pos_weight(est_dl, cap=pos_cap, max_batches=25, device=device)
-    print(f"[Info] 估计像素正例率≈{pos_ratio:.6f} -> BCE pos_weight={pos_w_val:.2f}"
-          f"{' (capped)' if pos_w_val == pos_cap else ''}")
-    pos_weight_t = torch.tensor([pos_w_val], dtype=torch.float32, device=device)
-
-    # 7) 模型
-    net = UNet(
-        in_ch=1,
-        base=int(cfg.get("base", 16)),
-        depth=int(cfg.get("depth", 4)),
-        norm=str(cfg.get("norm", "gn")),
-        drop=float(cfg.get("dropout", 0.05)),
-    ).to(device)
-
-    # 首次训练：输出层偏置=先验概率（若非续训、且未指定 init_ckpt）
-    is_fresh = not (cfg.get("resume") or cfg.get("auto_resume")) and not cfg.get("init_ckpt")
-    if is_fresh:
-        prior = float(cfg.get("init_prior_prob", 0.1))
-        with torch.no_grad():
-            net.out_conv.bias.fill_(_logit(prior))
-        print(f"[Init] out_conv.bias <- logit({prior:.4f}) = {_logit(prior):.3f}")
-
-    # EMA Teacher（按需）
-    ema_decay = float(cfg.get("ema_decay", 0.0))
-    ema_model = copy_model(net) if ema_decay > 0 else None
-
-    # Loss info
-    lt = str(cfg.get("loss_type", "bce_dice")).lower()
-    print(f"[Loss] using {lt}")
-
-    opt = AdamW(
-        net.parameters(),
-        lr=float(cfg.get("lr", 1e-3)),
-        weight_decay=float(cfg.get("weight_decay", 1e-4)),
-    )
-    sched = ReduceLROnPlateau(
-        opt, mode="min", factor=0.5,
-        patience=int(cfg.get("plateau_patience", 10)),
-        min_lr=float(cfg.get("min_lr", 1e-6)),
-    )
-
-    grad_clip = float(cfg.get("grad_clip", 0.0))
-
-    # 8) 保存目录 & 续训策略
-    save_dir = Path(str(cfg.get("save_dir", "runs_mps")))
-    os.makedirs(save_dir, exist_ok=True)
-    best_pt = str(save_dir / "best.pt")
-    best_ckpt = str(save_dir / "best.ckpt")
-    last_ckpt = str(save_dir / "last.ckpt")
-
-    start_epoch, best_dice, best_thr = 1, -1.0, 0.5
-
-    resume = cfg.get("resume", "")
-    resume_full = bool(cfg.get("resume_full", False))
-    allow_partial = bool(cfg.get("allow_partial", False))
-    strict_arch = bool(cfg.get("strict_arch", True))
-
-    if (not resume) and bool(cfg.get("auto_resume", False)):
-        if Path(last_ckpt).exists():
-            resume, resume_full = last_ckpt, True
-        elif Path(best_ckpt).exists():
-            resume, resume_full = best_ckpt, True
-        elif Path(best_pt).exists():
-            resume, resume_full = best_pt, False
-
-    loaded_obj = None
-    if resume and Path(resume).exists():
-        rtype, obj = load_any_weights(
-            resume, net, opt if resume_full else None, sched if resume_full else None,
-            map_location=device, allow_partial=allow_partial, strict_arch=strict_arch
-        )
-        print(f"==> Loaded {rtype} weights from {resume}. {'带优化器/调度器' if resume_full else '仅模型'}")
-        loaded_obj = obj
-        if rtype == "full" and isinstance(obj, dict):
-            start_epoch = int(obj.get("epoch", 0)) + 1
-            best_dice = float(obj.get("best_dice", -1.0))
-            best_thr = float(obj.get("best_thr", 0.5))
+    # splits 优先
+    tr_list=set(read_split_names(split_dir, "train.txt")); va_list=set(read_split_names(split_dir, "val.txt"))
+    if tr_list and va_list:
+        tr_idx=[i for i,p in enumerate(img_paths) if p.stem in tr_list]
+        va_idx=[i for i,p in enumerate(img_paths) if p.stem in va_list]
     else:
-        init_ckpt = cfg.get("init_ckpt", "")
-        if init_ckpt and Path(init_ckpt).exists():
-            _rtype, _ = load_any_weights(init_ckpt, net, optimizer=None, scheduler=None,
-                                         map_location=device, allow_partial=allow_partial, strict_arch=strict_arch)
-            print(f"==> Model initialized from {init_ckpt} ({_rtype})")
+        idxs=list(range(len(img_paths))); random.shuffle(idxs)
+        n_val=max(1,int(0.2*len(idxs)))
+        va_idx=idxs[:n_val]; tr_idx=idxs[n_val:]
 
-    # === 未标注数据 ===
-    unlabeled_dir = str(cfg.get("unlabeled_dir", "")).strip()
-    dl_ul, unl_iter = None, None
-    if unlabeled_dir:
-        u = Path(unlabeled_dir)
-        if not u.is_absolute():
-            # 容错：避免 data_root="data" + unlabeled_dir="data/unlabeled" -> data/data/unlabeled
-            parts = u.parts
-            if len(parts) >= 2 and parts[0] == str(data_root):
-                u = Path(*parts[1:])
-            udir = (data_root / u)
-        else:
-            udir = u
-        if udir.exists():
-            ul_imgs = [p for p in sorted(udir.rglob("*")) if p.is_file() and p.suffix.lower() in IMG_EXTS]
-            if ul_imgs:
-                ds_ul = UnlabeledDataset(
-                    ul_imgs,
-                    img_size=img_size,
-                    flip_p=float(cfg.get("flip_p", 0.5)),
-                    jitter=float(cfg.get("jitter", 0.2)),
-                    rotate90_p=float(cfg.get("rotate90_p", 0.5)),
-                    gamma_jitter=float(cfg.get("gamma_jitter", 0.25)),
-                    crop_mode=str(cfg.get("crop_mode", "mix")),
-                    crop_size=int(cfg.get("crop_size", max(128, img_size // 2))),
-                    lesion_p=float(cfg.get("lesion_p", 0.8)),
-                    cache_images=bool(cfg.get("cache_images", True)),
-                )
-                dl_ul = DataLoader(ds_ul, batch_size=int(cfg.get("unlabeled_batch", batch)),
-                                   shuffle=True, num_workers=0, pin_memory=False)
-                unl_iter = iter(dl_ul)
-                print(f"[UL] 未标注样本数={len(ds_ul)} batch={int(cfg.get('unlabeled_batch', batch))}")
-            else:
-                print(f"[UL] 未在 {udir} 找到未标注图像")
-        else:
-            print(f"[UL] 未标注目录不存在：{udir}")
+    tr_imgs=[img_paths[i] for i in tr_idx]; tr_msks=[mask_paths[i] for i in tr_idx]
+    va_imgs=[img_paths[i] for i in va_idx]; va_msks=[mask_paths[i] for i in va_idx]
+    ul_imgs=list_images(unl_dir)
 
-    # 9) 训练循环
-    epochs = int(cfg.get("epochs", 200))
-    patience = int(cfg.get("patience", 20))
-    th_min, th_max, th_step = (
-        float(cfg.get("th_min", 0.05)),
-        float(cfg.get("th_max", 0.95)),
-        float(cfg.get("th_step", 0.05)),
-    )
+    print(f"数据统计: total={len(img_paths)} | train={len(tr_imgs)} val={len(va_imgs)} | unlabeled={len(ul_imgs)} | device={device.type}")
 
-    patience_counter = 0
+    ds_tr = LabeledSet(tr_imgs, tr_msks, cfg)
+    ds_va = LabeledSet(va_imgs, va_msks, {**cfg, "flip_p":0, "rotate90_p":0, "jitter":0, "gamma_jitter":0, "crop_mode":"none", "cache_images":cfg["cache_images"]})
+    dl_tr = DataLoader(ds_tr, batch_size=int(cfg["batch"]), shuffle=True, num_workers=int(cfg["num_workers"]), pin_memory=False)
+    dl_va = DataLoader(ds_va, batch_size=max(1,int(cfg["batch"])*2), shuffle=False, num_workers=0, pin_memory=False)
+
+    # 估计正像素率 -> BCE pos_weight
+    est_dl = DataLoader(ds_tr, batch_size=max(1,int(cfg["batch"])*2), shuffle=False, num_workers=0)
+    pos_w, pos_ratio = compute_pos_weight(est_dl, cap=float(cfg["pos_weight_cap"]), device=device)
+    pos_weight_t = torch.tensor([pos_w], dtype=torch.float32, device=device)
+    cfg["pos_ratio_runtime"] = float(pos_ratio)
+    print(f"[Info] 正像素率≈{pos_ratio:.6f} -> BCE pos_weight={pos_w:.2f}"
+          f"{' (capped)' if abs(pos_w - float(cfg['pos_weight_cap']))<1e-6 else ''}")
+
+    # 模型 & EMA
+    net = ResNetAttentionUNet(num_classes=1, pretrained=True, freeze_bn=True).to(device)
+    with torch.no_grad():
+        # 输出层 bias 先验（收敛更稳）
+        b = logit(float(cfg["init_prior_prob"]))
+        net.out_conv.bias.fill_(b)
+    ema = copy_model(net) if float(cfg["ema_decay"])>0 else None
+
+    # 优化器 / 调度器
+    optimizer, scheduler, base_lr_scaled, min_lr_scaled = build_opt_sched(net, cfg, int(cfg["epochs"]))
+    print(f"[LR] base={base_lr_scaled:.6g}  min={min_lr_scaled:.6g}  warmup={int(cfg['lr_warmup_epochs'])}  policy=cosine")
+
+    # 未标注 loader
+    dl_ul=None
+    if ul_imgs:
+        ds_ul = UnlabeledSet(ul_imgs, cfg)
+        dl_ul = DataLoader(ds_ul, batch_size=int(cfg["unlabeled_batch"]), shuffle=True, num_workers=0, pin_memory=False)
+        print(f"[UL] 未标注样本数={len(ds_ul)} batch={int(cfg['unlabeled_batch'])}")
+
+    # 训练循环
+    save_dir = Path(cfg["save_dir"]); save_dir.mkdir(parents=True, exist_ok=True)
+    best_pt = save_dir/"best.pt"; last_ckpt = save_dir/"last.ckpt"
+    best_dice, best_thr, best_epoch = -1.0, 0.5, 0
+    patience = 0
     t0 = time.time()
-    best_epoch = start_epoch
 
-    for epoch in range(start_epoch, epochs + 1):
-        tr_loss = run_epoch(
-            net, dl_tr, opt, device, cfg, pos_weight_t, grad_clip=grad_clip,
-            unl_iter=iter(dl_ul) if dl_ul is not None else None,  # 每个 epoch 刷新迭代器
-            ema_model=ema_model, ema_decay=ema_decay,
-            epoch=epoch, warmup_epochs=int(cfg.get("ema_warmup_epochs", 5)),
-        )
+    for epoch in range(1, int(cfg["epochs"])+1):
+        net.train()
+        losses=[]
+        # 半监督权重缓升（余弦）
+        if float(cfg["unlabeled_weight"])>0 and dl_ul is not None:
+            t = min(1.0, epoch/max(1.0, float(cfg["unlabeled_ramp_epochs"])))
+            lam_u = (0.5 - 0.5*math.cos(math.pi*t)) * float(cfg["unlabeled_weight"])
+        else:
+            lam_u = 0.0
 
-        # eval: 用 EMA（若开启且 ema_eval=true），并可启用 TTA 指标
-        use_ema_for_eval = bool(cfg.get("ema_eval", False)) and (ema_model is not None)
-        model_eval = ema_model if use_ema_for_eval else net
+        th_h=float(cfg["pseudo_thr_high"]); th_l=float(cfg["pseudo_thr_low"])
+        mean_gate=float(cfg["pseudo_mean_gate"])
+        v_w=float(cfg["volume_reg_weight"])
+        v_tgt = float(cfg["volume_target"]) if float(cfg["volume_target"])>0 else float(np.clip(cfg["pos_ratio_runtime"]*1.5, 0.02, 0.20))
+        ul_iter = iter(dl_ul) if (dl_ul is not None and lam_u>0) else None
 
-        va_loss, va_dice, va_thr, metrics = evaluate_once(
-            model_eval, dl_va, device, cfg, pos_weight_t, th_min, th_max, th_step
-        )
+        for x,y in dl_tr:
+            x=x.to(device); y=y.to(device)
+            optimizer.zero_grad(set_to_none=True)
 
-        sched.step(va_loss)
-        lr_now = opt.param_groups[0]["lr"]
+            logits = net(x)
+            sup = compute_loss(logits, y, cfg, pos_weight_t)
+            prob = torch.sigmoid(logits)
+            reg  = volume_regularizer(prob, v_tgt, v_w)
 
-        print(
-            f"Epoch {epoch:03d}/{epochs} | train_loss={tr_loss:.4f} | val_loss={va_loss:.4f} | "
-            f"val_dice={va_dice:.4f} | best_thr≈{va_thr:.2f} | lr={lr_now:.6f} | "
-            f"pred_pos@0.5={metrics['pred_pos@0.5']:.6f} prob_mean={metrics['prob_mean']:.4f} "
-            f"empty_gt={metrics['empty_gt_ratio']:.2f}"
-        )
+            unsup = x.new_zeros(())
+            if ul_iter is not None:
+                try:
+                    xu = next(ul_iter).to(device)
+                except StopIteration:
+                    ul_iter = iter(dl_ul)
+                    xu = next(ul_iter).to(device)
 
-        # 保存最优
+                with torch.no_grad():
+                    if ema is not None and bool(cfg["pseudo_tta"]):
+                        p_teacher = predict_tta(ema, xu)
+                    elif ema is not None:
+                        p_teacher = torch.sigmoid(ema(xu))
+                    else:
+                        p_teacher = torch.sigmoid(net(xu))
+                    # 双阈像素门控 + 图像均值门控
+                    conf_mask = ((p_teacher>=th_h) | (p_teacher<=th_l)).float()
+                    mean_val  = p_teacher.mean(dim=(1,2,3), keepdim=True)
+                    mean_ok   = ((mean_val>mean_gate*0.5) & (mean_val<1.0-mean_gate*0.5)).float()
+                    conf_mask = conf_mask * mean_ok
+                    pseudo = (p_teacher>0.5).float()
+
+                logits_u = net(xu)
+                bce_pix = F.binary_cross_entropy_with_logits(logits_u, pseudo, reduction="none")
+                denom = conf_mask.sum().clamp_min(1.0)
+                unsup = (bce_pix * conf_mask).sum() / denom
+
+            loss = sup + lam_u*unsup + reg
+            loss.backward()
+            if float(cfg["grad_clip"])>0:
+                nn.utils.clip_grad_norm_(net.parameters(), float(cfg["grad_clip"]))
+            optimizer.step()
+
+            # EMA 更新（慢热）
+            if ema is not None and float(cfg["ema_decay"])>0:
+                if epoch <= int(cfg["ema_warmup_epochs"]):
+                    decay_now = float(cfg["ema_decay"]) * (epoch/max(1,int(cfg["ema_warmup_epochs"])))**0.5
+                else:
+                    decay_now = float(cfg["ema_decay"])
+                ema_update(ema, net, decay_now)
+
+            losses.append(float(loss.item()))
+
+        scheduler.step()
+
+        # 验证（可选用 EMA 模型）
+        eval_model = ema if bool(cfg["ema_eval"]) and ema is not None else net
+        va_loss, va_dice, va_thr, metrics = evaluate(eval_model, dl_va, device, cfg, pos_weight_t)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch:03d}/{cfg['epochs']} | train_loss={np.mean(losses):.4f} | "
+              f"val_loss={va_loss:.4f} | val_dice={va_dice:.4f} | best_thr≈{va_thr:.2f} | lr={lr_now:.6g}")
+
+        # 保存
         if va_dice > best_dice:
             best_dice, best_thr, best_epoch = va_dice, va_thr, epoch
             torch.save(net.state_dict(), best_pt)
-            save_ckpt(best_ckpt, net, opt, sched, epoch, best_dice, best_thr, cfg)
-            if HAVE_SAFETENSORS:
-                safe_path = str(Path(best_pt).with_suffix(".safetensors"))
-                safe_save_file(net.state_dict(), safe_path)
-            print(f"✅ New BEST saved: {best_pt}  dice={best_dice:.4f} (epoch {epoch})")
-            patience_counter = 0
+            torch.save({
+                "model": net.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_dice": best_dice,
+                "best_thr": best_thr,
+                "cfg": cfg
+            }, last_ckpt)
+            print(f"  ✅ New BEST saved: {best_pt}  dice={best_dice:.4f} (epoch {epoch})")
+            patience = 0
         else:
-            patience_counter += 1
+            patience += 1
+            torch.save({
+                "model": net.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_dice": best_dice,
+                "best_thr": best_thr,
+                "cfg": cfg
+            }, last_ckpt)
 
-        # 每个 epoch 保存最近断点
-        save_ckpt(last_ckpt, net, opt, sched, epoch, best_dice, best_thr, cfg)
-
-        if patience_counter >= patience:
+        if patience >= int(cfg["patience"]):
             print(f"Early stop at epoch {epoch}. Best dice={best_dice:.4f} @thr={best_thr:.2f} (epoch {best_epoch})")
             break
 
     print(f"Done. Best dice={best_dice:.4f} @thr={best_thr:.2f} (epoch {best_epoch}). Weights -> {best_pt}")
     print(f"Total time: {time.time()-t0:.1f}s")
 
-
-# -----------------------
-# 启动入口
-# -----------------------
-def build_parser():
-    p = argparse.ArgumentParser(description="NF-1 tumor segmentation trainer (MPS + Focal-Tversky + EMA + TTA)")
-    p.add_argument("--config", default="", help="YAML 配置路径。留空则使用 <repo_root>/configs/train.yaml")
-    p.add_argument("--resume", default=None, help="优先覆盖 YAML 的 resume")
-    p.add_argument("--resume_full", action="store_true", help="覆盖 YAML 的 resume_full=True")
-    p.add_argument("--save_dir", default=None, help="覆盖 YAML 的 save_dir")
-    return p
-
-def merge_cli_over_yaml(yaml_cfg: dict, args):
-    cfg = dict(yaml_cfg)
-    if args.resume is not None:
-        cfg["resume"] = args.resume
-    if args.resume_full:
-        cfg["resume_full"] = True
-    if args.save_dir is not None:
-        cfg["save_dir"] = args.save_dir
-    return cfg
-
-def train_cli(cli_args=None):
-    parser = build_parser()
-    args = parser.parse_args(cli_args)
-    yaml_cfg = load_config(args.config)
-    cfg = merge_cli_over_yaml(yaml_cfg, args)
-    main(cfg)
+# ------------------------
+# CLI 覆盖
+# ------------------------
+def parse_args():
+    p = argparse.ArgumentParser("NF1 ResNet-AttentionUNet Semi-supervised Trainer")
+    # 常用覆盖项
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch", type=int, default=None)
+    p.add_argument("--unlabeled_batch", type=int, default=None)
+    p.add_argument("--img_size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--save_dir", type=str, default=None)
+    p.add_argument("--loss_type", type=str, default=None)
+    p.add_argument("--unlabeled_weight", type=float, default=None)
+    p.add_argument("--tta_val", type=int, default=None)
+    return p.parse_args()
 
 if __name__ == "__main__":
-    train_cli()
+    args = parse_args()
+    cfg = CFG.copy()
+    for k, v in vars(args).items():
+        if v is not None:
+            # bool 参数：0/1 -> False/True
+            if isinstance(CFG.get(k), bool):
+                cfg[k] = bool(v)
+            else:
+                cfg[k] = v
+    os.makedirs(cfg["save_dir"], exist_ok=True)
+    train(cfg)
