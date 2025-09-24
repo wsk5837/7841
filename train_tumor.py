@@ -1,18 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-NF1 Tumor Segmentation — ResNet50 Attention-UNet + Semi-supervised Mean-Teacher
-- 预训练 ResNet 编码器（RGB + ImageNet 规范化；冻结 BN 统计）
-- 半监督：EMA Teacher + TTA 伪标签 + 双阈/均值门控 + 余弦缓升权重
-- Loss：BCE+Tversky / Focal-Tversky / BCE+Dice（自动估计 pos_weight）
-- LR：线性 Warmup -> 余弦退火；EMA 慢热；Dice 阈值网格搜索；可选 TTA 验证
-目录：
-data/
- ├─ raw/           # 已标注图像（任意常见格式，RGB/灰度都可）
- ├─ masks_tumor/   # 同名掩膜（>0 为前景）
- ├─ unlabeled/     # 未标注图像（可空）
- └─ splits/        # 可选 train.txt / val.txt（每行一个不含扩展名的文件名）
-"""
-
 import os, math, time, copy, random, argparse
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Set
@@ -25,11 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW, SGD
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingWarmRestarts
 from torchvision.models import resnet50, ResNet50_Weights
 
 # ------------------------
-# Config（可用命令行覆盖）
+# Config
 # ------------------------
 CFG = dict(
     seed=7,
@@ -43,15 +28,15 @@ CFG = dict(
     img_size=512,
     flip_p=0.5,
     rotate90_p=0.5,
-    jitter=0.2,        # 乘法亮度抖动
-    gamma_jitter=0.25, # Gamma 抖动
+    jitter=0.2,
+    gamma_jitter=0.25,
     crop_mode="mix",   # none|random|lesion|mix
     crop_size=320,
-    lesion_p=0.8,
+    lesion_p=0.9,
     cache_images=True,
 
     # 训练
-    epochs=300,
+    epochs=80,          # ★ 最多 80
     patience=40,
     batch=2,
     unlabeled_batch=2,
@@ -68,34 +53,62 @@ CFG = dict(
     lr_warmup_epochs=10,
     lr_warmup_start=1e-5,
 
+    # ★ Warmup → Cosine + Warm Restarts（首次重启在第 20 轮）
+    lr_policy="warmcos_restart",
+    restart_T0=10,      # ★ warmup(10)+T0(10)=20
+    restart_Tmult=2,
+
     # Loss 相关
     loss_type="bce_tversky",  # bce_tversky|focal_tversky|bce_dice
     bce_w=0.4,
     dice_w=0.6,
-    tversky_alpha=0.7,
-    tversky_beta=0.3,
-    focal_gamma=0.75,
-    pos_weight_cap=50.0,
-    init_prior_prob=0.08,   # 输出层 bias 先验
+    tversky_alpha=0.55,
+    tversky_beta=0.45,
+    # 动态切换到更均衡
+    tversky_switch_epoch=12,
+    tversky_alpha_late=0.50,
+    tversky_beta_late=0.50,
 
-    # 体素占比正则（可选）
-    volume_reg_weight=0.0,
-    volume_target=0.0,      # 0=自动用正像素率*1.5 限幅[0.02,0.20]
+    focal_gamma=0.75,
+    pos_weight_cap=25.0,
+    init_prior_prob=0.08,
+
+    # 体素占比正则（温和）
+    volume_reg_weight=0.10,
+    volume_target=0.0,        # 0=自动用正像素率*1.5 限幅[0.02,0.20]
 
     # 半监督（EMA Teacher + Pseudo-label）
     ema_decay=0.995,
     ema_warmup_epochs=20,
     ema_eval=True,
-    unlabeled_weight=0.3,
-    unlabeled_ramp_epochs=60,
-    pseudo_thr_high=0.90,
-    pseudo_thr_low=0.10,
-    pseudo_mean_gate=0.50,
-    pseudo_tta=True,        # Teacher 伪标签 TTA
+    unlabeled_weight=0.8,
+    unlabeled_ramp_epochs=40,
+
+    # ★ 关键超参（本版新增/调整）
+    lam_u_cap=0.6,              # ★ 无监督封顶
+    lam_u_freeze_epoch=25,      # ★ 此后不再上升
+    sup_only_period=5,          # ★ 每 5 轮监督-only
+    teacher_tau=0.7,            # ★ 温度锐化
+    conf_drop_low=0.03,         # ★ 整批丢弃阈（下）
+    conf_drop_high=0.30,        # ★ 整批丢弃阈（上）
+    pseudo_topk_ratio=0.10,     # ★ 每图前 10% 最确定像素
+    pseudo_topk_cap=50000,      # ★ 每图最多 50k 像素
+    pseudo_thr_high=0.80,
+    pseudo_thr_low=0.20,
+    pseudo_tta=True,
+    pseudo_soft_weight=True,    # 仍做软权，但与 top-k 合并
+    pseudo_gamma=1.5,
 
     # 验证 & 阈值搜索
-    tta_val=False,
-    th_min=0.05, th_max=0.95, th_step=0.05,
+    tta_val=True,
+    th_min=0.05, th_max=0.95, th_step=0.01,
+
+    # 归一化选项（decoder 的 BN 可换 GN；默认不换，仅冻结）
+    decoder_norm="bn",         # "bn" | "gn"
+    gn_groups=16,
+
+    # 断点续训
+    resume="",                 # 路径：best.pt 或 last.ckpt（可为空）
 )
 
 IMG_EXTS: Set[str] = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -126,7 +139,6 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
 
 def pil_to_tensor_rgb_norm(im: Image.Image) -> torch.Tensor:
-    # 保证三通道
     if im.mode != "RGB": im = im.convert("RGB")
     arr = np.asarray(im, dtype=np.float32) / 255.0  # HWC
     x = torch.from_numpy(np.transpose(arr, (2,0,1)))  # CHW
@@ -159,8 +171,11 @@ def read_split_names(split_dir: Path, name: str) -> List[str]:
     if not f.exists(): return []
     return [x.strip() for x in open(f, "r", encoding="utf-8") if x.strip()]
 
-def logit(p: float, eps: float = 1e-6) -> float:
-    p = max(min(float(p), 1 - eps), eps); return math.log(p/(1-p))
+def logit_np(p: np.ndarray, eps: float = 1e-6):
+    p = np.clip(p, eps, 1 - eps); return np.log(p/(1-p))
+
+def logit_torch(p: torch.Tensor, eps: float = 1e-6):
+    p = p.clamp(eps, 1 - eps); return torch.log(p/(1 - p))
 
 # ------------------------
 # Dataset
@@ -208,7 +223,6 @@ class LabeledSet(Dataset):
 
     def __getitem__(self, i):
         x, y = self._get(i)
-        # 轻量增强（图像/掩膜对齐）
         if self.flip_p>0 and random.random()<self.flip_p:
             if random.random()<0.5: x = torch.flip(x,[2]); y = torch.flip(y,[2])
             else: x = torch.flip(x,[1]); y = torch.flip(y,[1])
@@ -220,7 +234,7 @@ class LabeledSet(Dataset):
             x = x*fac
         if self.gamma_jitter>0:
             g = 1.0 + (random.random()*2-1)*self.gamma_jitter
-            x = torch.clamp(x, -5, 5)  # 防爆
+            x = torch.clamp(x, -5, 5)
             x = torch.sign(x) * (torch.abs(x) ** g)
 
         if self.crop_mode!="none" and self.crop_size>0:
@@ -291,7 +305,6 @@ class AttentionGate(nn.Module):
         self.act     = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
     def forward(self, x, g):
-        # x: skip, g: gating (decoder feature)
         theta = self.theta_x(x)
         phi   = self.phi_g(g)
         if theta.shape[-2:] != phi.shape[-2:]:
@@ -324,8 +337,15 @@ class DecoderBlock(nn.Module):
             x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
+def replace_bn_with_gn(module: nn.Module, num_groups=16):
+    for name, m in module.named_children():
+        if isinstance(m, nn.BatchNorm2d):
+            setattr(module, name, nn.GroupNorm(num_groups=num_groups, num_channels=m.num_features))
+        else:
+            replace_bn_with_gn(m, num_groups)
+
 class ResNetAttentionUNet(nn.Module):
-    def __init__(self, num_classes=1, pretrained=True, freeze_bn=True):
+    def __init__(self, num_classes=1, pretrained=True, freeze_bn=True, decoder_norm="bn", gn_groups=16):
         super().__init__()
         weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
         encoder = resnet50(weights=weights)
@@ -338,20 +358,25 @@ class ResNetAttentionUNet(nn.Module):
         self.layer3 = encoder.layer3  # C=1024, /16
         self.layer4 = encoder.layer4  # C=2048, /32
 
-        # 冻结 BN 统计，避免小 batch 震荡
-        if freeze_bn:
-            self._freeze_bn(self)
-
         # Center 1x1 降维
         self.center = nn.Conv2d(2048, 1024, kernel_size=1)
 
         # Decoder with attention
-        self.dec4 = DecoderBlock(1024, 1024, 512, use_att=True)  # skip=layer3
-        self.dec3 = DecoderBlock(512,  512,  256, use_att=True)  # skip=layer2
-        self.dec2 = DecoderBlock(256,  256,  128, use_att=True)  # skip=layer1
-        self.dec1 = DecoderBlock(128,   64,   64, use_att=True)  # skip=conv1
+        self.dec4 = DecoderBlock(1024, 1024, 512, use_att=True)
+        self.dec3 = DecoderBlock(512,  512,  256, use_att=True)
+        self.dec2 = DecoderBlock(256,  256,  128, use_att=True)
+        self.dec1 = DecoderBlock(128,   64,   64, use_att=True)
+
+        if decoder_norm.lower() == "gn":
+            replace_bn_with_gn(self.dec1, gn_groups)
+            replace_bn_with_gn(self.dec2, gn_groups)
+            replace_bn_with_gn(self.dec3, gn_groups)
+            replace_bn_with_gn(self.dec4, gn_groups)
 
         self.out_conv = nn.Conv2d(64, num_classes, kernel_size=1)
+
+        if freeze_bn:
+            self._freeze_bn(self)
 
     @staticmethod
     def _freeze_bn(module):
@@ -361,11 +386,11 @@ class ResNetAttentionUNet(nn.Module):
                 for p in m.parameters(): p.requires_grad_(False)
 
     def forward(self, x):
-        x0 = self.conv1(x)         # 64,  /2
+        x0 = self.conv1(x)               # 64,  /2
         x1 = self.layer1(self.pool(x0))  # 256, /4
-        x2 = self.layer2(x1)       # 512, /8
-        x3 = self.layer3(x2)       # 1024,/16
-        x4 = self.layer4(x3)       # 2048,/32
+        x2 = self.layer2(x1)             # 512, /8
+        x3 = self.layer3(x2)             # 1024,/16
+        x4 = self.layer4(x3)             # 2048,/32
 
         c  = self.center(x4)
         d4 = self.dec4(c,  x3)
@@ -374,7 +399,6 @@ class ResNetAttentionUNet(nn.Module):
         d1 = self.dec1(d2, x0)
 
         logit = self.out_conv(d1)
-        # 补齐至输入大小
         logit = F.interpolate(logit, size=x.shape[-2:], mode="bilinear", align_corners=False)
         return logit
 
@@ -386,24 +410,25 @@ def soft_dice(prob: torch.Tensor, tgt: torch.Tensor, eps=1e-6):
     union = prob.sum(dim=(1,2,3)) + tgt.sum(dim=(1,2,3))
     return ((2*inter + eps) / (union + eps)).mean()
 
-def tversky_loss(prob, tgt, alpha=0.7, beta=0.3, eps=1e-6):
+def tversky_loss(prob, tgt, alpha=0.55, beta=0.45, eps=1e-6):
     tp = (prob*tgt).sum((1,2,3))
     fp = (prob*(1-tgt)).sum((1,2,3))
     fn = ((1-prob)*tgt).sum((1,2,3))
     t  = (tp+eps)/(tp + alpha*fp + beta*fn + eps)
     return (1 - t).mean()
 
-def compute_loss(logits, tgt, cfg, pos_weight_t):
+def compute_loss_with_ab(logits, tgt, cfg, pos_weight_t, alpha=None, beta=None):
     prob = torch.sigmoid(logits)
     lt = str(cfg["loss_type"]).lower()
+    a = float(cfg["tversky_alpha"]) if alpha is None else float(alpha)
+    b = float(cfg["tversky_beta"])  if beta  is None else float(beta)
     if lt == "focal_tversky":
-        base = tversky_loss(prob, tgt, alpha=float(cfg["tversky_alpha"]), beta=float(cfg["tversky_beta"]))
+        base = tversky_loss(prob, tgt, alpha=a, beta=b)
         return torch.pow(base, float(cfg["focal_gamma"]))
     if lt == "bce_tversky":
         bce = F.binary_cross_entropy_with_logits(logits, tgt, pos_weight=pos_weight_t)
-        tv  = tversky_loss(prob, tgt, alpha=float(cfg["tversky_alpha"]), beta=float(cfg["tversky_beta"]))
+        tv  = tversky_loss(prob, tgt, alpha=a, beta=b)
         return float(cfg["bce_w"])*bce + float(cfg["dice_w"])*tv
-    # bce_dice
     bce = F.binary_cross_entropy_with_logits(logits, tgt, pos_weight=pos_weight_t)
     dice = soft_dice(prob, tgt)
     return float(cfg["bce_w"])*bce + float(cfg["dice_w"])*(1 - dice)
@@ -414,7 +439,7 @@ def volume_regularizer(prob: torch.Tensor, target_ratio: float, w: float):
     return w * (pred_ratio - target_ratio).pow(2).mean()
 
 @torch.no_grad()
-def compute_pos_weight(loader, cap=50.0, max_batches=25, device="cpu"):
+def compute_pos_weight(loader, cap=25.0, max_batches=25, device="cpu"):
     pos, tot, n = 0.0, 0.0, 0
     for _,y in loader:
         y = y.to(device)
@@ -460,63 +485,111 @@ def build_opt_sched(net: nn.Module, cfg: Dict[str,Any], epochs: int):
     base_lr = float(cfg["lr"]); min_lr=float(cfg["min_lr"]); wd=float(cfg["weight_decay"])
     momentum=float(cfg["momentum"]); warm=int(cfg["lr_warmup_epochs"])
     nbs=int(cfg["nbs"]); batch=int(cfg["batch"])
-    # 按 batch 线性缩放（与 TF 经验一致）
     if opt_type in ["adam", "adamw"]:
         lr_limit_max, lr_limit_min = 1e-4, 1e-4
     else:
         lr_limit_max, lr_limit_min = 1e-1, 5e-4
     base_lr_scaled = min(max(batch/nbs*base_lr, lr_limit_min), lr_limit_max)
     min_lr_scaled  = min(max(batch/nbs*min_lr,  lr_limit_min*1e-2), lr_limit_max*1e-2)
+
     if opt_type == "sgd":
         optimizer = SGD(net.parameters(), lr=base_lr_scaled, momentum=momentum, nesterov=True, weight_decay=wd)
     elif opt_type == "adam":
         optimizer = torch.optim.Adam(net.parameters(), lr=base_lr_scaled, betas=(momentum,0.999), weight_decay=wd)
     else:
         optimizer = AdamW(net.parameters(), lr=base_lr_scaled, weight_decay=wd)
-    def lr_lambda(ep):
-        if ep < warm:
-            start=float(cfg["lr_warmup_start"])
-            alpha=(ep+1)/max(1,warm)
-            return (start + (base_lr_scaled-start)*alpha)/base_lr_scaled
-        prog=(ep-warm)/max(1, epochs-warm)
-        cosine=0.5*(1+math.cos(math.pi*min(1.0,max(0.0,prog))))
-        lr_now=min_lr_scaled + (base_lr_scaled-min_lr_scaled)*cosine
-        return lr_now/base_lr_scaled
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    policy = str(cfg.get("lr_policy","warmcos_restart")).lower()
+    if policy == "warmcos_restart":
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=int(cfg.get("restart_T0", 10)),   # ★ 10
+            T_mult=int(cfg.get("restart_Tmult", 2)),
+            eta_min=min_lr_scaled
+        )
+    else:
+        def lr_lambda(ep):
+            if ep < warm:
+                start=float(cfg["lr_warmup_start"])
+                alpha=(ep+1)/max(1,warm)
+                return (start + (base_lr_scaled-start)*alpha)/base_lr_scaled
+            prog=(ep-warm)/max(1,epochs-warm)
+            cosine=0.5*(1+math.cos(math.pi*min(1.0,max(0.0,prog))))
+            lr_now=min_lr_scaled + (base_lr_scaled-min_lr_scaled)*cosine
+            return lr_now/base_lr_scaled
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     return optimizer, scheduler, base_lr_scaled, min_lr_scaled
 
 # ------------------------
 # Evaluate
 # ------------------------
 @torch.no_grad()
-def evaluate(net, loader, device, cfg, pos_weight_t):
+def evaluate(net, loader, device, cfg, pos_weight_t, alpha, beta):
+    """
+    保留原先的阈值扫描与 best_thr 挑选（按 Dice 最大），
+    并在 best_thr 处计算 IoU / Precision / Recall / PixelAcc / SkinIoU。
+    SkinIoU 定义为背景类 IoU = TN / (TN + FP + FN)。
+    """
     net.eval()
-    ths = np.arange(float(cfg["th_min"]), float(cfg["th_max"])+1e-9, float(cfg["th_step"]), dtype=np.float32).tolist()
-    inter_acc = torch.zeros(len(ths), device=device); pred_sum_acc=torch.zeros(len(ths), device=device)
-    tgt_sum_acc = torch.zeros((), device=device)
+    ths = np.arange(float(cfg["th_min"]), float(cfg["th_max"])+1e-9,
+                    float(cfg["th_step"]), dtype=np.float32).tolist()
+
+    inter_acc   = torch.zeros(len(ths), device=device)  # TP
+    pred_sum_acc= torch.zeros(len(ths), device=device)  # 预测为正
+    tgt_sum_acc = torch.zeros((), device=device)        # GT 正
+    total_pixels= torch.zeros((), device=device)        # 总像素
+
     total_loss, nb = 0.0, 0
     dice_list=[]
+
     for x,y in loader:
         x=x.to(device); y=y.to(device)
         logits = net(x)  # 验证损失不用 TTA
-        loss = compute_loss(logits,y,cfg,pos_weight_t)
+        loss = compute_loss_with_ab(logits,y,cfg,pos_weight_t,alpha=alpha,beta=beta)
         total_loss += float(loss.item()); nb += 1
 
         prob = predict_tta(net,x) if bool(cfg["tta_val"]) else torch.sigmoid(logits)
         dice_list.append(soft_dice(prob,y).item())
 
+        B, C, H, W = prob.shape
         tgt_sum_acc += y.sum()
-        for i,th in enumerate(ths):
+        total_pixels += torch.tensor(float(B*H*W), device=device)
+
+        for i, th in enumerate(ths):
             pred = (prob>th).to(torch.float32)
-            inter_acc[i] += (pred*y).sum()
-            pred_sum_acc[i] += pred.sum()
+            inter_acc[i]    += (pred*y).sum()   # TP
+            pred_sum_acc[i] += pred.sum()       # 预测正
 
     eps=1e-6
     dice_all = (2.0*inter_acc + eps)/(pred_sum_acc + tgt_sum_acc + eps)
     best_idx = int(torch.argmax(dice_all).item())
-    best_dice = float(dice_all[best_idx].item()); best_thr=float(ths[best_idx])
+    best_dice = float(dice_all[best_idx].item())
+    best_thr = float(ths[best_idx])
     val_loss = float(total_loss/max(1,nb))
-    return val_loss, best_dice, best_thr, dict(avg_dice=float(np.mean(dice_list)) if dice_list else 0.0)
+
+    # 在 best_thr 处一次性求出全部指标
+    TP = inter_acc[best_idx]
+    pred_sum = pred_sum_acc[best_idx]
+    tgt_sum = tgt_sum_acc
+    FP = pred_sum - TP
+    FN = tgt_sum - TP
+    TN = total_pixels - TP - FP - FN
+
+    iou        = (TP / (TP + FP + FN + eps)).item()
+    precision  = (TP / (TP + FP + eps)).item()
+    recall     = (TP / (TP + FN + eps)).item()
+    pixel_acc  = ((TP + TN) / (total_pixels + eps)).item()
+    skin_iou   = (TN / (TN + FP + FN + eps)).item()
+
+    metrics = dict(
+        avg_dice=float(np.mean(dice_list)) if dice_list else 0.0,
+        IoU=iou,
+        Precision=precision,
+        Recall=recall,
+        PixelAcc=pixel_acc,
+        SkinIoU=skin_iou
+    )
+    return val_loss, best_dice, best_thr, metrics
 
 # ------------------------
 # Train
@@ -524,6 +597,7 @@ def evaluate(net, loader, device, cfg, pos_weight_t):
 def train(cfg):
     set_seed(int(cfg["seed"]))
     device = pick_device()
+    dev_type = device.type
 
     root = Path(cfg["data_root"])
     img_dir = root / cfg["img_dir"]; mask_dir=root / cfg["mask_dir"]; unl_dir=root / cfg["unlabeled_dir"]
@@ -554,23 +628,48 @@ def train(cfg):
 
     # 估计正像素率 -> BCE pos_weight
     est_dl = DataLoader(ds_tr, batch_size=max(1,int(cfg["batch"])*2), shuffle=False, num_workers=0)
-    pos_w, pos_ratio = compute_pos_weight(est_dl, cap=float(cfg["pos_weight_cap"]), device=device)
-    pos_weight_t = torch.tensor([pos_w], dtype=torch.float32, device=device)
+    pos_w0, pos_ratio = compute_pos_weight(est_dl, cap=float(cfg["pos_weight_cap"]), device=device)
     cfg["pos_ratio_runtime"] = float(pos_ratio)
-    print(f"[Info] 正像素率≈{pos_ratio:.6f} -> BCE pos_weight={pos_w:.2f}"
-          f"{' (capped)' if abs(pos_w - float(cfg['pos_weight_cap']))<1e-6 else ''}")
+    pos_w_min = max(12.0, pos_w0 * 0.4)   # ★ 下限 12
+
+    print(f"[Info] 正像素率≈{pos_ratio:.6f} -> BCE pos_weight0={pos_w0:.2f}"
+          f"{' (capped)' if abs(pos_w0 - float(cfg['pos_weight_cap']))<1e-6 else ''}")
 
     # 模型 & EMA
-    net = ResNetAttentionUNet(num_classes=1, pretrained=True, freeze_bn=True).to(device)
+    net = ResNetAttentionUNet(
+        num_classes=1, pretrained=True, freeze_bn=True,
+        decoder_norm=str(cfg.get("decoder_norm","bn")), gn_groups=int(cfg.get("gn_groups",16))
+    ).to(device)
     with torch.no_grad():
-        # 输出层 bias 先验（收敛更稳）
-        b = logit(float(cfg["init_prior_prob"]))
-        net.out_conv.bias.fill_(b)
+        b = logit_np(np.array([float(cfg["init_prior_prob"])], dtype=np.float32))[0]
+        net.out_conv.bias.fill_(float(b))
     ema = copy_model(net) if float(cfg["ema_decay"])>0 else None
+
+    # 断点续训（可选）
+    if str(cfg.get("resume","")).strip():
+        path = str(cfg["resume"])
+        sd = torch.load(path, map_location=device)
+        state = sd.get("model", sd) if isinstance(sd, dict) else sd
+        missing = net.load_state_dict(state, strict=False)
+        if ema is not None:
+            ema = copy_model(net)
+        print(f"[Resume] loaded from {path}. missing_keys={len(missing.missing_keys)}")
 
     # 优化器 / 调度器
     optimizer, scheduler, base_lr_scaled, min_lr_scaled = build_opt_sched(net, cfg, int(cfg["epochs"]))
-    print(f"[LR] base={base_lr_scaled:.6g}  min={min_lr_scaled:.6g}  warmup={int(cfg['lr_warmup_epochs'])}  policy=cosine")
+    print(f"[LR] base={base_lr_scaled:.6g}  min={min_lr_scaled:.6g}  warmup={int(cfg['lr_warmup_epochs'])}  policy={cfg.get('lr_policy')}")
+
+    # 计算热重启发生的 epoch（用于 LR 拉回 & 无监督去噪）
+    restarts = []
+    if str(cfg.get("lr_policy","warmcos_restart")).lower() == "warmcos_restart":
+        warm = int(cfg["lr_warmup_epochs"])
+        T = int(cfg.get("restart_T0", 10))
+        Tmult = int(cfg.get("restart_Tmult", 2))
+        e = warm + T  # 第一次重启点
+        while e <= int(cfg["epochs"]):
+            restarts.append(e)
+            T = T * Tmult
+            e += T
 
     # 未标注 loader
     dl_ul=None
@@ -586,30 +685,63 @@ def train(cfg):
     patience = 0
     t0 = time.time()
 
+    # AMP（仅 CUDA，MPS 关闭）
+    use_amp = (dev_type=="cuda")
+    if use_amp:
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        scaler = None
+
     for epoch in range(1, int(cfg["epochs"])+1):
         net.train()
         losses=[]
-        # 半监督权重缓升（余弦）
-        if float(cfg["unlabeled_weight"])>0 and dl_ul is not None:
-            t = min(1.0, epoch/max(1.0, float(cfg["unlabeled_ramp_epochs"])))
-            lam_u = (0.5 - 0.5*math.cos(math.pi*t)) * float(cfg["unlabeled_weight"])
-        else:
-            lam_u = 0.0
 
-        th_h=float(cfg["pseudo_thr_high"]); th_l=float(cfg["pseudo_thr_low"])
-        mean_gate=float(cfg["pseudo_mean_gate"])
+        # ---------- 半监督权重 ---------- #
+        t = min(1.0, epoch/max(1.0, float(cfg["unlabeled_ramp_epochs"])))
+        lam_u_raw = (0.5 - 0.5*math.cos(math.pi*t)) * float(cfg["unlabeled_weight"])
+        lam_u = min(lam_u_raw, float(cfg["lam_u_cap"]))
+        if epoch >= int(cfg["lam_u_freeze_epoch"]):
+            lam_u = min(lam_u, float(cfg["lam_u_cap"]))  # 冻结上限
+        if (epoch in restarts) or (epoch-1 in restarts) or (epoch+1 in restarts):
+            lam_u *= 0.6
+        # ★ 每 5 轮监督-only
+        if int(cfg["sup_only_period"])>0 and (epoch % int(cfg["sup_only_period"]) == 0):
+            lam_u_epoch = 0.0
+        else:
+            lam_u_epoch = lam_u
+
+        # pos_weight 温和衰减
+        r = min(1.0, epoch / max(1.0, float(cfg["unlabeled_ramp_epochs"])))
+        pos_w_now = pos_w0*(1.0-r) + pos_w_min*r
+        pos_weight_t = torch.tensor([pos_w_now], dtype=torch.float32, device=device)
+
+        # Tversky 动态切换
+        alpha = float(cfg["tversky_alpha"])
+        beta  = float(cfg["tversky_beta"])
+        if epoch >= int(cfg.get("tversky_switch_epoch", 12)):
+            alpha = float(cfg.get("tversky_alpha_late", alpha))
+            beta  = float(cfg.get("tversky_beta_late",  beta))
+
         v_w=float(cfg["volume_reg_weight"])
         v_tgt = float(cfg["volume_target"]) if float(cfg["volume_target"])>0 else float(np.clip(cfg["pos_ratio_runtime"]*1.5, 0.02, 0.20))
-        ul_iter = iter(dl_ul) if (dl_ul is not None and lam_u>0) else None
+        th_h=float(cfg["pseudo_thr_high"]); th_l=float(cfg["pseudo_thr_low"])
+        ul_iter = iter(dl_ul) if (dl_ul is not None and lam_u_epoch>0) else None
 
         for x,y in dl_tr:
             x=x.to(device); y=y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            logits = net(x)
-            sup = compute_loss(logits, y, cfg, pos_weight_t)
-            prob = torch.sigmoid(logits)
-            reg  = volume_regularizer(prob, v_tgt, v_w)
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = net(x)
+                    sup = compute_loss_with_ab(logits, y, cfg, pos_weight_t, alpha=alpha, beta=beta)
+                    prob = torch.sigmoid(logits)
+                    reg  = volume_regularizer(prob, v_tgt, v_w)
+            else:
+                logits = net(x)
+                sup = compute_loss_with_ab(logits, y, cfg, pos_weight_t, alpha=alpha, beta=beta)
+                prob = torch.sigmoid(logits)
+                reg  = volume_regularizer(prob, v_tgt, v_w)
 
             unsup = x.new_zeros(())
             if ul_iter is not None:
@@ -626,23 +758,62 @@ def train(cfg):
                         p_teacher = torch.sigmoid(ema(xu))
                     else:
                         p_teacher = torch.sigmoid(net(xu))
-                    # 双阈像素门控 + 图像均值门控
-                    conf_mask = ((p_teacher>=th_h) | (p_teacher<=th_l)).float()
-                    mean_val  = p_teacher.mean(dim=(1,2,3), keepdim=True)
-                    mean_ok   = ((mean_val>mean_gate*0.5) & (mean_val<1.0-mean_gate*0.5)).float()
-                    conf_mask = conf_mask * mean_ok
-                    pseudo = (p_teacher>0.5).float()
 
-                logits_u = net(xu)
-                bce_pix = F.binary_cross_entropy_with_logits(logits_u, pseudo, reduction="none")
-                denom = conf_mask.sum().clamp_min(1.0)
-                unsup = (bce_pix * conf_mask).sum() / denom
+                    # ★ 温度锐化
+                    tau = float(cfg.get("teacher_tau", 0.7))
+                    if tau != 1.0:
+                        p_teacher = torch.sigmoid(logit_torch(p_teacher) / max(1e-3, tau))
 
-            loss = sup + lam_u*unsup + reg
-            loss.backward()
-            if float(cfg["grad_clip"])>0:
-                nn.utils.clip_grad_norm_(net.parameters(), float(cfg["grad_clip"]))
-            optimizer.step()
+                    # 高置信像素占比（用于整批丢弃）
+                    hi_mask = ((p_teacher>=th_h) | (p_teacher<=th_l)).float()
+                    hi_frac = hi_mask.mean().item()
+
+                    # ★ 批级过滤：在 [3%,30%] 之外则整批丢弃无监督
+                    if (hi_frac < float(cfg["conf_drop_low"])) or (hi_frac > float(cfg["conf_drop_high"])):
+                        pass
+                    else:
+                        # ★ Top-k 选最确定像素
+                        B, _, H, W = p_teacher.shape
+                        conf = torch.abs(p_teacher - 0.5) * 2.0  # [0,1]
+                        w = torch.zeros_like(conf)
+                        k_ratio = float(cfg.get("pseudo_topk_ratio", 0.10))
+                        k_cap = int(cfg.get("pseudo_topk_cap", 50000))
+                        N = H*W
+                        k = max(1, min(int(N * k_ratio), k_cap))
+                        conf_flat = conf.view(B, -1)
+                        topk_vals, topk_idx = torch.topk(conf_flat, k=k, dim=1, largest=True, sorted=False)
+                        w_flat = torch.zeros_like(conf_flat)
+                        w_flat.scatter_(1, topk_idx, 1.0)
+                        w = w_flat.view_as(conf)
+
+                        # 与高置信门合取
+                        w = w * hi_mask
+
+                        if bool(cfg.get("pseudo_soft_weight", True)):
+                            gamma = float(cfg.get("pseudo_gamma", 1.5))
+                            w = w * (conf ** gamma)
+
+                        pseudo = (p_teacher>0.5).float()
+
+                        logits_u = net(xu)
+                        bce_pix = F.binary_cross_entropy_with_logits(logits_u, pseudo, reduction="none")
+                        denom = w.sum().clamp_min(1.0)
+                        unsup = (bce_pix * w).sum() / denom
+
+            loss = sup + lam_u_epoch*unsup + reg
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                if float(cfg["grad_clip"])>0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(net.parameters(), float(cfg["grad_clip"]))
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if float(cfg["grad_clip"])>0:
+                    nn.utils.clip_grad_norm_(net.parameters(), float(cfg["grad_clip"]))
+                optimizer.step()
 
             # EMA 更新（慢热）
             if ema is not None and float(cfg["ema_decay"])>0:
@@ -654,42 +825,55 @@ def train(cfg):
 
             losses.append(float(loss.item()))
 
-        scheduler.step()
+        # ---- 学习率步进（支持 warmup + 热重启）----
+        warm = int(cfg["lr_warmup_epochs"])
+        if str(cfg.get("lr_policy","warmcos_restart")).lower() == "warmcos_restart":
+            if epoch <= warm:
+                start=float(cfg["lr_warmup_start"])
+                lr_now = start + (base_lr_scaled - start) * (epoch / max(1,warm))
+                for g in optimizer.param_groups: g["lr"] = lr_now
+            else:
+                scheduler.step()
+                if epoch in restarts:
+                    for g in optimizer.param_groups:
+                        g["lr"] = base_lr_scaled
+        else:
+            scheduler.step()
 
-        # 验证（可选用 EMA 模型）
+        # 验证（可选用 EMA 模型；alpha/beta 用当期设定）
         eval_model = ema if bool(cfg["ema_eval"]) and ema is not None else net
-        va_loss, va_dice, va_thr, metrics = evaluate(eval_model, dl_va, device, cfg, pos_weight_t)
+        va_loss, va_dice, va_thr, metrics = evaluate(eval_model, dl_va, device, cfg, pos_weight_t, alpha, beta)
 
         lr_now = optimizer.param_groups[0]["lr"]
         print(f"Epoch {epoch:03d}/{cfg['epochs']} | train_loss={np.mean(losses):.4f} | "
-              f"val_loss={va_loss:.4f} | val_dice={va_dice:.4f} | best_thr≈{va_thr:.2f} | lr={lr_now:.6g}")
+              f"val_loss={va_loss:.4f} | val_dice={va_dice:.4f} | best_thr≈{va_thr:.2f} | "
+              f"lr={lr_now:.6g} | pos_w≈{pos_w_now:.2f} | lam_u={lam_u_epoch:.3f}")
+        # 新增：与 Lim 一致的指标打印
+        print(f"   IoU={metrics['IoU']:.4f}  Precision={metrics['Precision']:.4f}  "
+              f"Recall={metrics['Recall']:.4f}  Acc={metrics['PixelAcc']:.4f}  "
+              f"SkinIoU={metrics['SkinIoU']:.4f}")
 
         # 保存
+        save_dir = Path(cfg["save_dir"])
+        best_pt = save_dir/"best.pt"; last_ckpt = save_dir/"last.ckpt"
+        torch.save({
+            "model": net.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_dice": max(best_dice, va_dice),
+            "best_thr": va_thr,
+            "cfg": cfg
+        }, last_ckpt)
+
         if va_dice > best_dice:
             best_dice, best_thr, best_epoch = va_dice, va_thr, epoch
             torch.save(net.state_dict(), best_pt)
-            torch.save({
-                "model": net.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_dice": best_dice,
-                "best_thr": best_thr,
-                "cfg": cfg
-            }, last_ckpt)
-            print(f"  ✅ New BEST saved: {best_pt}  dice={best_dice:.4f} (epoch {epoch})")
+            tag = "(EMA/eval)" if (eval_model is ema) else ""
+            print(f"  ✅ New BEST {tag} saved: {best_pt}  dice={best_dice:.4f} (epoch {epoch})")
             patience = 0
         else:
             patience += 1
-            torch.save({
-                "model": net.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_dice": best_dice,
-                "best_thr": best_thr,
-                "cfg": cfg
-            }, last_ckpt)
 
         if patience >= int(cfg["patience"]):
             print(f"Early stop at epoch {epoch}. Best dice={best_dice:.4f} @thr={best_thr:.2f} (epoch {best_epoch})")
@@ -702,7 +886,7 @@ def train(cfg):
 # CLI 覆盖
 # ------------------------
 def parse_args():
-    p = argparse.ArgumentParser("NF1 ResNet-AttentionUNet Semi-supervised Trainer")
+    p = argparse.ArgumentParser("NF1 ResNet-AttentionUNet Semi-supervised Trainer (robust)")
     # 常用覆盖项
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch", type=int, default=None)
@@ -712,7 +896,38 @@ def parse_args():
     p.add_argument("--save_dir", type=str, default=None)
     p.add_argument("--loss_type", type=str, default=None)
     p.add_argument("--unlabeled_weight", type=float, default=None)
+    p.add_argument("--unlabeled_ramp_epochs", type=float, default=None)
     p.add_argument("--tta_val", type=int, default=None)
+    # 学习率策略
+    p.add_argument("--lr_policy", type=str, default=None)
+    p.add_argument("--restart_T0", type=int, default=None)
+    p.add_argument("--restart_Tmult", type=int, default=None)
+    # Tversky 动态
+    p.add_argument("--tversky_alpha", type=float, default=None)
+    p.add_argument("--tversky_beta", type=float, default=None)
+    p.add_argument("--tversky_switch_epoch", type=int, default=None)
+    p.add_argument("--tversky_alpha_late", type=float, default=None)
+    p.add_argument("--tversky_beta_late", type=float, default=None)
+    p.add_argument("--pos_weight_cap", type=float, default=None)
+    p.add_argument("--volume_reg_weight", type=float, default=None)
+    # 归一化
+    p.add_argument("--decoder_norm", type=str, default=None)   # bn|gn
+    p.add_argument("--gn_groups", type=int, default=None)
+    # 伪标签/教师设置
+    p.add_argument("--teacher_tau", type=float, default=None)
+    p.add_argument("--pseudo_soft_weight", type=int, default=None)
+    p.add_argument("--pseudo_gamma", type=float, default=None)
+    p.add_argument("--pseudo_thr_high", type=float, default=None)
+    p.add_argument("--pseudo_thr_low", type=float, default=None)
+    p.add_argument("--pseudo_topk_ratio", type=float, default=None)
+    p.add_argument("--pseudo_topk_cap", type=int, default=None)
+    p.add_argument("--lam_u_cap", type=float, default=None)
+    p.add_argument("--lam_u_freeze_epoch", type=int, default=None)
+    p.add_argument("--sup_only_period", type=int, default=None)
+    p.add_argument("--conf_drop_low", type=float, default=None)
+    p.add_argument("--conf_drop_high", type=float, default=None)
+    # 断点续训
+    p.add_argument("--resume", type=str, default=None)
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -720,7 +935,6 @@ if __name__ == "__main__":
     cfg = CFG.copy()
     for k, v in vars(args).items():
         if v is not None:
-            # bool 参数：0/1 -> False/True
             if isinstance(CFG.get(k), bool):
                 cfg[k] = bool(v)
             else:
